@@ -6,11 +6,11 @@
  * The token is stored in wp_options as `cmms_icredit_settings`.
  *
  * We keep production and test tokens in separate fields so admins
- * can switch between modes without copy-pasting back and forth.
+ * can switch between modes without copy-pasting back and forth. 
  */
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-class CMMS_Admin_Icredit {
+class CMMS_Admin_Icredit { 
 
     const CAP  = 'manage_options';
     const SLUG = 'cmms-light-icredit';

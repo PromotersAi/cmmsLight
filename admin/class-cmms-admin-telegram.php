@@ -5,7 +5,7 @@
  * Single screen for managing the Telegram bot integration:
  *   - Enable/disable
  *   - Bot token (BotFather)
- *   - Bot username
+ *   - Bot username 
  *   - Webhook status (live check via getWebhookInfo)
  *   - Test connection (calls getMe)
  *   - Connect/Disconnect (calls setWebhook / deleteWebhook)

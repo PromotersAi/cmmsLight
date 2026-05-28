@@ -8,7 +8,7 @@ class CMMS_Activator {
         self::create_pages();
         self::create_upload_dir();
         self::run_migrations();
-        update_option( 'cmms_light_version', CMMS_LIGHT_VERSION );
+        update_option( 'cmms_light_version', CMMS_LIGHT_VERSION ); 
         flush_rewrite_rules();
     }
 

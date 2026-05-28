@@ -8,7 +8,7 @@
  *   - Payments: ledger of every payment attempt (initial + recurring)
  *   - Subscriptions: active/past_due/frozen/canceled subscriptions
  *
- * Pure read-only on the Payments tab. The Subscriptions tab supports
+ * Pure read-only on the Payments tab. The Subscriptions tab supports 
  * cancellation — but only marks the row as canceled in our DB; the
  * admin must separately cancel the recurring sale in iCredit (we show
  * a clear warning about this).

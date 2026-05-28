@@ -9,7 +9,7 @@
  * Text Domain: cmms-light
  */
 
-if ( ! defined( 'ABSPATH' ) ) {
+if ( ! defined( 'ABSPATH' ) ) { 
     exit;
 }
 

@@ -12,7 +12,7 @@
 if ( ! defined( 'ABSPATH' ) ) exit;
 
 if ( ! headers_sent() ) {
-    header( 'X-Robots-Tag: noindex, nofollow, noarchive, nosnippet, noimageindex' );
+    header( 'X-Robots-Tag: noindex, nofollow, noarchive, nosnippet, noimageindex' ); 
 }
 
 add_filter( 'show_admin_bar', '__return_false' );

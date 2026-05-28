@@ -7,7 +7,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-class CMMS_Admin {
+class CMMS_Admin { 
 
     public function register() {
         add_action( 'admin_menu', array( $this, 'menu' ) );

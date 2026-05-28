@@ -7,7 +7,7 @@
 ## 1. ⭐ Telegram - מילוי טפסי משימה דרך הבוט
 
 **העלה:** Guy (26/05/2026)
-**Phase מוצע:** Telegram Phase 4
+**Phase מוצע:** Telegram Phase 4 
 
 ### הרעיון
 

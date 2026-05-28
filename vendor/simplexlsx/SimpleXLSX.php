@@ -5,7 +5,7 @@
  * which would add ~5MB of dependencies for what is essentially "open zip,
  * read XML, give me cells".
  *
- * Origin: distilled from public-domain example code by Sergey Shuchkin.
+ * Origin: distilled from public-domain exam ple code by Sergey Shuchkin.
  * Reduced to only the read-rows feature we need; no styles, no images,
  * no formulas, no write support.
  */
