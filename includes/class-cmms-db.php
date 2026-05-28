@@ -24,7 +24,30 @@ class CMMS_DB {
             'packages'         => $p . 'cmms_packages',
             'payments'         => $p . 'cmms_payments',
             'subscriptions'    => $p . 'cmms_subscriptions',
-            'email_templates'  => $p . 'cmms_email_templates',
+            'email_templates'   => $p . 'cmms_email_templates',
+            // 1.14.84: Telegram bot integration
+            'telegram_users'    => $p . 'cmms_telegram_users',
+            'telegram_logs'     => $p . 'cmms_telegram_logs',
+            // 1.14.85: Mapping of task notifications to chat_id+message_id
+            // for in-place edits when status changes
+            'telegram_task_messages' => $p . 'cmms_telegram_task_messages',
+            // 1.14.94: Webhook API keys per form for external integrations
+            'webhook_keys'      => $p . 'cmms_webhook_keys',
+            // 1.14.98: Email-to-task routing - one email slug per form,
+            // letting external email forwards create tasks. Slug is the
+            // local-part of an email address: <slug>@tasks.cmms.co.il
+            'email_routes'      => $p . 'cmms_email_routes',
+            // 1.15.3: Task signatures - external party (customer)
+            // signing off that work was performed. Stored as PNG
+            // (base64-decoded blob) plus metadata (signer name, role,
+            // type — customer vs technician). Multiple signatures per
+            // task allowed for cases with multiple visits or both
+            // parties signing.
+            'task_signatures'   => $p . 'cmms_task_signatures',
+            // 1.15.5: Email-to-task inbound log. One row per incoming
+            // email (success or failure) so customers can see what
+            // arrived and debug missing tasks. Auto-pruned after 30 days.
+            'email_inbox_log'   => $p . 'cmms_email_inbox_log',
         );
     }
 
@@ -162,18 +185,26 @@ class CMMS_DB {
             created_by BIGINT(20) UNSIGNED DEFAULT NULL,
             started_at DATETIME DEFAULT NULL,
             completed_at DATETIME DEFAULT NULL,
+            completion_lat DECIMAL(10,7) DEFAULT NULL,
+            completion_lng DECIMAL(10,7) DEFAULT NULL,
+            completion_address VARCHAR(500) DEFAULT NULL,
+            completion_location_source VARCHAR(20) DEFAULT NULL,
             created_at DATETIME NOT NULL,
             updated_at DATETIME NOT NULL,
+            deleted_at DATETIME DEFAULT NULL,
             PRIMARY KEY (id),
             KEY account_id (account_id),
             KEY status (status),
             KEY assigned_to (assigned_to),
             KEY manager_id (manager_id),
+            KEY created_by (created_by),
             KEY category_id (category_id),
             KEY asset_id (asset_id),
             KEY due_date (due_date),
             KEY started_at (started_at),
-            KEY completed_at (completed_at)
+            KEY completed_at (completed_at),
+            KEY deleted_at (deleted_at),
+            KEY account_status (account_id, status)
         ) $charset;";
 
         $sql[] = "CREATE TABLE {$t['task_logs']} (
@@ -215,6 +246,7 @@ class CMMS_DB {
             description TEXT,
             slug VARCHAR(190) NOT NULL,
             manager_id BIGINT(20) UNSIGNED DEFAULT NULL,
+            default_assignee_id BIGINT(20) UNSIGNED DEFAULT NULL,
             default_category_id BIGINT(20) UNSIGNED DEFAULT NULL,
             default_priority VARCHAR(20) NOT NULL DEFAULT 'normal',
             default_status VARCHAR(20) NOT NULL DEFAULT 'open',
@@ -245,11 +277,13 @@ class CMMS_DB {
             task_id BIGINT(20) UNSIGNED DEFAULT NULL,
             data LONGTEXT,
             ip_address VARCHAR(60) DEFAULT NULL,
+            source_type VARCHAR(20) NOT NULL DEFAULT 'public_form',
             created_at DATETIME NOT NULL,
             PRIMARY KEY (id),
             KEY form_id (form_id),
             KEY account_id (account_id),
-            KEY task_id (task_id)
+            KEY task_id (task_id),
+            KEY source_type (source_type)
         ) $charset;";
 
         // In-app notification feed (one row per recipient per event).
@@ -318,6 +352,10 @@ class CMMS_DB {
             price DECIMAL(10,2) NOT NULL DEFAULT 0,
             currency VARCHAR(3) NOT NULL DEFAULT 'ILS',
             max_users INT(11) DEFAULT NULL,
+            included_seats INT(11) DEFAULT NULL,
+            seat_addon_price DECIMAL(10,2) DEFAULT NULL,
+            hard_user_limit INT(11) DEFAULT NULL,
+            upgrade_recommended_at INT(11) DEFAULT NULL,
             billing_mode VARCHAR(20) NOT NULL DEFAULT 'one_time',
             icredit_page_id VARCHAR(190) DEFAULT NULL,
             external_payment_reference VARCHAR(190) DEFAULT NULL,
@@ -368,6 +406,7 @@ class CMMS_DB {
             plan_type VARCHAR(20) DEFAULT NULL,
             billing_cycle VARCHAR(10) DEFAULT NULL,
             amount DECIMAL(10,2) NOT NULL DEFAULT 0,
+            seats_added INT(11) NOT NULL DEFAULT 0,
             currency VARCHAR(3) NOT NULL DEFAULT 'ILS',
             status VARCHAR(20) NOT NULL DEFAULT 'pending',
             provider VARCHAR(20) NOT NULL DEFAULT 'icredit',
@@ -380,6 +419,7 @@ class CMMS_DB {
             subscription_id BIGINT(20) UNSIGNED DEFAULT NULL,
             ipn_raw LONGTEXT DEFAULT NULL,
             ipn_received_at DATETIME DEFAULT NULL,
+            debug_payload LONGTEXT DEFAULT NULL,
             verified_at DATETIME DEFAULT NULL,
             created_at DATETIME NOT NULL,
             updated_at DATETIME NOT NULL,
@@ -416,6 +456,10 @@ class CMMS_DB {
             plan_type VARCHAR(20) DEFAULT NULL,
             billing_cycle VARCHAR(10) DEFAULT NULL,
             amount DECIMAL(10,2) NOT NULL DEFAULT 0,
+            base_amount DECIMAL(10,2) NOT NULL DEFAULT 0,
+            seats_amount DECIMAL(10,2) NOT NULL DEFAULT 0,
+            seats_purchased INT(11) NOT NULL DEFAULT 0,
+            pending_seats_change INT(11) DEFAULT NULL,
             currency VARCHAR(3) NOT NULL DEFAULT 'ILS',
             provider VARCHAR(20) NOT NULL DEFAULT 'icredit',
             external_subscription_id VARCHAR(190) DEFAULT NULL,
@@ -457,6 +501,212 @@ class CMMS_DB {
             updated_at DATETIME NOT NULL,
             PRIMARY KEY (id),
             UNIQUE KEY template_key (template_key)
+        ) $charset;";
+
+        // 1.14.84: Telegram users — mapping between CMMS users and
+        // Telegram accounts. One row per CMMS user that connected.
+        //   - link_token: short-lived nonce used in the /start deep link.
+        //     Generated when user clicks "Connect Telegram" in profile;
+        //     consumed (and cleared) when user runs /start <token>.
+        //   - telegram_user_id: Telegram's numeric user ID, set after
+        //     successful linking. NULL means "linking pending".
+        //   - last_active_task_id: which task the user is currently
+        //     working on. Used to route incoming photos/comments
+        //     when no Reply context is available (Phase 3).
+        $sql[] = "CREATE TABLE {$t['telegram_users']} (
+            id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            account_id BIGINT(20) UNSIGNED NOT NULL,
+            cmms_user_id BIGINT(20) UNSIGNED NOT NULL,
+            telegram_user_id BIGINT(20) DEFAULT NULL,
+            telegram_username VARCHAR(100) DEFAULT NULL,
+            telegram_first_name VARCHAR(100) DEFAULT NULL,
+            link_token VARCHAR(64) DEFAULT NULL,
+            link_token_expires DATETIME DEFAULT NULL,
+            last_active_task_id BIGINT(20) UNSIGNED DEFAULT NULL,
+            connected_at DATETIME DEFAULT NULL,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            UNIQUE KEY cmms_user_id (cmms_user_id),
+            KEY account_id (account_id),
+            KEY telegram_user_id (telegram_user_id),
+            KEY link_token (link_token)
+        ) $charset;";
+
+        // 1.14.84: Telegram message logs — every inbound and outbound
+        // message for forensics + rate-limit detection. We keep raw
+        // payloads (JSON) so when something misbehaves we can replay
+        // the exact data that came in.
+        //   - direction: 'in' (Telegram → us) or 'out' (us → Telegram)
+        //   - kind: 'message', 'callback', 'photo', 'webhook_set', etc
+        //   - task_id: if the log relates to a specific task (for
+        //     filtering audit views)
+        $sql[] = "CREATE TABLE {$t['telegram_logs']} (
+            id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            account_id BIGINT(20) UNSIGNED DEFAULT NULL,
+            cmms_user_id BIGINT(20) UNSIGNED DEFAULT NULL,
+            telegram_user_id BIGINT(20) DEFAULT NULL,
+            task_id BIGINT(20) UNSIGNED DEFAULT NULL,
+            direction VARCHAR(10) NOT NULL,
+            kind VARCHAR(40) NOT NULL,
+            payload LONGTEXT,
+            response_code INT(11) DEFAULT NULL,
+            error_text TEXT,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            KEY account_id (account_id),
+            KEY telegram_user_id (telegram_user_id),
+            KEY task_id (task_id),
+            KEY created_at (created_at)
+        ) $charset;";
+
+        // 1.14.85: Track every Telegram message that was sent for
+        // a task, per recipient. Enables in-place editing when the
+        // status changes — we look up (task_id, telegram_user_id)
+        // and call editMessageText with the stored message_id.
+        //
+        //   - chat_id: where the message was delivered (usually the
+        //     telegram_user_id of the recipient)
+        //   - message_id: Telegram's internal id, needed for editing
+        //   - last_status: the status the message currently reflects.
+        //     Used to skip no-op edits when nothing changed.
+        $sql[] = "CREATE TABLE {$t['telegram_task_messages']} (
+            id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            account_id BIGINT(20) UNSIGNED NOT NULL,
+            task_id BIGINT(20) UNSIGNED NOT NULL,
+            cmms_user_id BIGINT(20) UNSIGNED NOT NULL,
+            telegram_user_id BIGINT(20) NOT NULL,
+            chat_id BIGINT(20) NOT NULL,
+            message_id BIGINT(20) NOT NULL,
+            last_status VARCHAR(40) DEFAULT NULL,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            UNIQUE KEY task_recipient (task_id, cmms_user_id),
+            KEY account_id (account_id),
+            KEY task_id (task_id),
+            KEY telegram_user_id (telegram_user_id)
+        ) $charset;";
+
+        // 1.14.94: Webhook API keys - one key per form, allows external
+        // systems to create tasks via REST API by POSTing JSON.
+        $sql[] = "CREATE TABLE {$t['webhook_keys']} (
+            id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            form_id BIGINT(20) UNSIGNED NOT NULL,
+            account_id BIGINT(20) UNSIGNED NOT NULL,
+            api_key_hash CHAR(64) NOT NULL,
+            key_prefix VARCHAR(16) NOT NULL,
+            enabled TINYINT(1) NOT NULL DEFAULT 1,
+            last_used_at DATETIME DEFAULT NULL,
+            request_count INT(11) NOT NULL DEFAULT 0,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            UNIQUE KEY form_id (form_id),
+            KEY account_id (account_id),
+            KEY api_key_hash (api_key_hash)
+        ) $charset;";
+
+        // 1.14.98: Email-to-task routes. Each form gets a unique slug
+        // (e.g. 'elevators-x7k2'); external systems forward emails to
+        // <slug>@tasks.cmms.co.il and CloudFlare Email Worker POSTs them
+        // to /email-inbox/<slug>. We auth via a shared HMAC secret in a
+        // header — not Bearer token like webhooks, because the Worker
+        // can't access per-form keys (it's a generic forwarder).
+        //
+        // Design rationale:
+        //   - Slug is the public identifier (the email address local-part).
+        //     Unguessable by design — built from random chars.
+        //   - HMAC secret is shared between CloudFlare Worker and this
+        //     plugin. The Worker signs the request body; we verify it.
+        //     One secret per account (not per form) so the Worker doesn't
+        //     need to look up secrets per incoming email.
+        //   - enabled flag lets us disable a route without deleting it,
+        //     useful when a customer leaks their email address.
+        $sql[] = "CREATE TABLE {$t['email_routes']} (
+            id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            form_id BIGINT(20) UNSIGNED NOT NULL,
+            account_id BIGINT(20) UNSIGNED NOT NULL,
+            email_slug VARCHAR(64) NOT NULL,
+            enabled TINYINT(1) NOT NULL DEFAULT 1,
+            last_used_at DATETIME DEFAULT NULL,
+            request_count INT(11) NOT NULL DEFAULT 0,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            UNIQUE KEY form_id (form_id),
+            UNIQUE KEY email_slug (email_slug),
+            KEY account_id (account_id)
+        ) $charset;";
+
+        // 1.15.3: Task signatures. Each row is one signing event.
+        // Use cases:
+        //   - Customer signs to confirm work was performed (legal proof)
+        //   - Technician signs to acknowledge responsibility
+        //   - Multiple visits → multiple signatures
+        //
+        // Design rationale:
+        //   - signature_data is a base64-encoded PNG (canvas.toDataURL).
+        //     We store it as LONGTEXT rather than as a file because:
+        //     (a) signatures are small (~5-30KB),
+        //     (b) it's atomic with the row,
+        //     (c) deleting the task deletes the signature automatically.
+        //   - signer_type distinguishes customer from technician so
+        //     the UI can show "Customer signature" vs "Technician signature".
+        //   - signer_name is mandatory — a signature without a name is
+        //     not legally binding in most jurisdictions.
+        //   - signer_role is the company/title (e.g. "Maintenance Manager"
+        //     or "ABC Corp") — optional but commonly recorded.
+        //   - signed_ip helps with disputes (proves who signed from where).
+        //   - signed_by_user_id ties the signature to a logged-in user
+        //     when applicable (the technician); null for external customers.
+        $sql[] = "CREATE TABLE {$t['task_signatures']} (
+            id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            task_id BIGINT(20) UNSIGNED NOT NULL,
+            account_id BIGINT(20) UNSIGNED NOT NULL,
+            signer_type VARCHAR(20) NOT NULL DEFAULT 'customer',
+            signer_name VARCHAR(190) NOT NULL,
+            signer_role VARCHAR(190) DEFAULT NULL,
+            signature_data LONGTEXT NOT NULL,
+            signed_by_user_id BIGINT(20) UNSIGNED DEFAULT NULL,
+            signed_ip VARCHAR(45) DEFAULT NULL,
+            signed_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            KEY task_id (task_id),
+            KEY account_id (account_id),
+            KEY signer_type (signer_type)
+        ) $charset;";
+
+        // 1.15.5: Email-to-task inbound log. One row per incoming email.
+        //
+        // Purpose:
+        //   - Visibility: customer sees what emails arrived and which
+        //     became tasks.
+        //   - Debugging: failed emails (too large, bad form, etc) are
+        //     logged with the failure reason so issues are diagnosable.
+        //
+        // Design rationale:
+        //   - status: 'created' (task made) | 'failed' (rejected) | 'test'
+        //   - task_id is nullable — failures and tests have no task.
+        //   - We store subject/sender but NOT the full body (privacy +
+        //     storage). The body lives in the task that was created.
+        //   - error_message holds the failure reason for failed rows.
+        //   - Auto-pruned after 30 days via prune_email_log (scheduled).
+        $sql[] = "CREATE TABLE {$t['email_inbox_log']} (
+            id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            account_id BIGINT(20) UNSIGNED NOT NULL,
+            form_id BIGINT(20) UNSIGNED DEFAULT NULL,
+            email_slug VARCHAR(64) DEFAULT NULL,
+            from_email VARCHAR(190) DEFAULT NULL,
+            from_name VARCHAR(190) DEFAULT NULL,
+            subject VARCHAR(255) DEFAULT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'created',
+            task_id BIGINT(20) UNSIGNED DEFAULT NULL,
+            error_message VARCHAR(255) DEFAULT NULL,
+            received_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            KEY account_id (account_id),
+            KEY form_id (form_id),
+            KEY received_at (received_at),
+            KEY status (status)
         ) $charset;";
 
         foreach ( $sql as $q ) {

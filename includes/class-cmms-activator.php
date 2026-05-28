@@ -290,6 +290,490 @@ class CMMS_Activator {
             self::backfill_recurring_ids();
             update_option( 'cmms_recurring_id_backfill_done', '1', false );
         }
+
+        // ─────────────────────────────────────────────────────────────
+        // 1.14.71: Seat management foundation (Phase 1).
+        //
+        // Adds seat-related columns to BOTH packages and subscriptions
+        // tables. dbDelta handles new installs via the CREATE TABLE in
+        // CMMS_DB; this migration covers upgrades from <=1.14.70 where
+        // the tables already exist without the new columns.
+        //
+        // All ALTERs are idempotent — guarded by SHOW COLUMNS checks.
+        //
+        // Schema additions:
+        //   packages.included_seats         — how many users are included in
+        //                                     the base price (3/10/null)
+        //   packages.seat_addon_price       — price per extra user/month
+        //   packages.hard_user_limit        — absolute ceiling per package
+        //                                     (10 / 25 / null = unlimited)
+        //   packages.upgrade_recommended_at — percent threshold to show
+        //                                     "upgrade recommended" prompt
+        //
+        //   subscriptions.base_amount           — package base price snapshot
+        //   subscriptions.seats_amount          — total cost of extra seats
+        //   subscriptions.seats_purchased       — count of extra seats above
+        //                                         included_seats
+        //   subscriptions.pending_seats_change  — negative number = scheduled
+        //                                         seat removal at next cycle
+        //
+        // After columns exist, a one-shot seed_packages_seat_defaults() runs
+        // to populate the seat fields on the 6 existing package rows. This
+        // is gated by 'cmms_seats_backfill_done' so it never re-runs.
+        // ─────────────────────────────────────────────────────────────
+
+        $packages_t = CMMS_DB::table( 'packages' );
+        if ( $packages_t ) {
+            $pkg_cols = (array) $wpdb->get_col( "SHOW COLUMNS FROM $packages_t" );
+            $seat_cols_to_add = array(
+                'included_seats'         => "ALTER TABLE $packages_t ADD COLUMN included_seats INT(11) DEFAULT NULL AFTER max_users",
+                'seat_addon_price'       => "ALTER TABLE $packages_t ADD COLUMN seat_addon_price DECIMAL(10,2) DEFAULT NULL AFTER included_seats",
+                'hard_user_limit'        => "ALTER TABLE $packages_t ADD COLUMN hard_user_limit INT(11) DEFAULT NULL AFTER seat_addon_price",
+                'upgrade_recommended_at' => "ALTER TABLE $packages_t ADD COLUMN upgrade_recommended_at INT(11) DEFAULT NULL AFTER hard_user_limit",
+            );
+            foreach ( $seat_cols_to_add as $col_name => $alter_sql ) {
+                if ( ! in_array( $col_name, $pkg_cols, true ) ) {
+                    $prev_show = $wpdb->show_errors;
+                    $wpdb->hide_errors();
+                    $wpdb->query( $alter_sql );
+                    if ( $prev_show ) $wpdb->show_errors();
+                }
+            }
+        }
+
+        $subs_t = CMMS_DB::table( 'subscriptions' );
+        if ( $subs_t ) {
+            $sub_cols = (array) $wpdb->get_col( "SHOW COLUMNS FROM $subs_t" );
+            $sub_cols_to_add = array(
+                'base_amount'          => "ALTER TABLE $subs_t ADD COLUMN base_amount DECIMAL(10,2) NOT NULL DEFAULT 0 AFTER amount",
+                'seats_amount'         => "ALTER TABLE $subs_t ADD COLUMN seats_amount DECIMAL(10,2) NOT NULL DEFAULT 0 AFTER base_amount",
+                'seats_purchased'      => "ALTER TABLE $subs_t ADD COLUMN seats_purchased INT(11) NOT NULL DEFAULT 0 AFTER seats_amount",
+                'pending_seats_change' => "ALTER TABLE $subs_t ADD COLUMN pending_seats_change INT(11) DEFAULT NULL AFTER seats_purchased",
+            );
+            foreach ( $sub_cols_to_add as $col_name => $alter_sql ) {
+                if ( ! in_array( $col_name, $sub_cols, true ) ) {
+                    $prev_show = $wpdb->show_errors;
+                    $wpdb->hide_errors();
+                    $wpdb->query( $alter_sql );
+                    if ( $prev_show ) $wpdb->show_errors();
+                }
+            }
+        }
+
+        // One-shot: populate seat defaults on the 6 packages and
+        // backfill seats_purchased for existing subscriptions.
+        if ( get_option( 'cmms_seats_backfill_done', '' ) !== '1.14.71' ) {
+            self::seed_packages_seat_defaults();
+            self::backfill_subscriptions_seats();
+            update_option( 'cmms_seats_backfill_done', '1.14.71', false );
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // 1.14.73: Phase 2b — iCredit Dynamic Amount.
+        //
+        // Adds payments.seats_added to record how many extra seats the
+        // customer paid for on this transaction. The IPN handler reads
+        // this on success and credits the same number to the subscription.
+        //
+        // Idempotent — guarded by SHOW COLUMNS.
+        // ─────────────────────────────────────────────────────────────
+        $payments_t = CMMS_DB::table( 'payments' );
+        if ( $payments_t ) {
+            $payments_cols = (array) $wpdb->get_col( "SHOW COLUMNS FROM $payments_t" );
+            if ( ! in_array( 'seats_added', $payments_cols, true ) ) {
+                $prev_show = $wpdb->show_errors;
+                $wpdb->hide_errors();
+                $wpdb->query(
+                    "ALTER TABLE $payments_t
+                     ADD COLUMN seats_added INT(11) NOT NULL DEFAULT 0 AFTER amount"
+                );
+                if ( $prev_show ) $wpdb->show_errors();
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // 1.14.79.1: debug_payload column on payments.
+        //
+        // Stores a JSON dump of:
+        //   - the full payload we send to iCredit GetUrl
+        //   - the HTTP response code
+        //   - the response body
+        //   - the request duration
+        // for every payment-creation attempt. Used to debug failures
+        // where iCredit returns a URL but their hosted page later
+        // rejects the sale (Error.htm) and no IPN ever fires — we
+        // need to see what we sent vs what they returned.
+        //
+        // Idempotent — guarded by SHOW COLUMNS.
+        // ─────────────────────────────────────────────────────────────
+        if ( $payments_t ) {
+            $payments_cols_v2 = (array) $wpdb->get_col( "SHOW COLUMNS FROM $payments_t" );
+            if ( ! in_array( 'debug_payload', $payments_cols_v2, true ) ) {
+                $prev_show = $wpdb->show_errors;
+                $wpdb->hide_errors();
+                $wpdb->query(
+                    "ALTER TABLE $payments_t
+                     ADD COLUMN debug_payload LONGTEXT NULL AFTER ipn_received_at"
+                );
+                if ( $prev_show ) $wpdb->show_errors();
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // 1.14.79: Performance indexes for the "mine" filter + Kanban.
+        //
+        // The "mine" filter does: assigned_to=ME OR manager_id=ME OR
+        // created_by=ME. The first two were already indexed; created_by
+        // was not. Plus a composite (account_id, status) speeds up the
+        // Kanban which bucket-loads tasks by status within an account.
+        //
+        // Idempotent — guarded by SHOW INDEX FROM.
+        // ─────────────────────────────────────────────────────────────
+        $tasks_t = CMMS_DB::table( 'tasks' );
+        if ( $tasks_t ) {
+            $existing_indexes = array();
+            $rows = $wpdb->get_results( "SHOW INDEX FROM $tasks_t", ARRAY_A );
+            foreach ( $rows as $r ) {
+                $existing_indexes[ $r['Key_name'] ] = true;
+            }
+            $prev_show = $wpdb->show_errors;
+            $wpdb->hide_errors();
+            if ( ! isset( $existing_indexes['created_by'] ) ) {
+                $wpdb->query( "ALTER TABLE $tasks_t ADD INDEX created_by (created_by)" );
+            }
+            if ( ! isset( $existing_indexes['account_status'] ) ) {
+                $wpdb->query( "ALTER TABLE $tasks_t ADD INDEX account_status (account_id, status)" );
+            }
+            if ( $prev_show ) $wpdb->show_errors();
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // 1.14.84: Telegram bot integration tables. Create them on
+        // existing installs (CMMS_DB::create_tables handles new ones).
+        // Idempotent — uses dbDelta which skips existing tables.
+        // ─────────────────────────────────────────────────────────────
+        $charset = $wpdb->get_charset_collate();
+        $tg_users_t = CMMS_DB::table( 'telegram_users' );
+        $tg_logs_t  = CMMS_DB::table( 'telegram_logs' );
+
+        if ( $tg_users_t ) {
+            // Check if table exists; if not, create it (existing installs).
+            $exists = $wpdb->get_var( $wpdb->prepare(
+                "SHOW TABLES LIKE %s", $tg_users_t
+            ) );
+            if ( ! $exists ) {
+                require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+                dbDelta( "CREATE TABLE {$tg_users_t} (
+                    id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+                    account_id BIGINT(20) UNSIGNED NOT NULL,
+                    cmms_user_id BIGINT(20) UNSIGNED NOT NULL,
+                    telegram_user_id BIGINT(20) DEFAULT NULL,
+                    telegram_username VARCHAR(100) DEFAULT NULL,
+                    telegram_first_name VARCHAR(100) DEFAULT NULL,
+                    link_token VARCHAR(64) DEFAULT NULL,
+                    link_token_expires DATETIME DEFAULT NULL,
+                    last_active_task_id BIGINT(20) UNSIGNED DEFAULT NULL,
+                    connected_at DATETIME DEFAULT NULL,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY cmms_user_id (cmms_user_id),
+                    KEY account_id (account_id),
+                    KEY telegram_user_id (telegram_user_id),
+                    KEY link_token (link_token)
+                ) $charset;" );
+            }
+        }
+
+        if ( $tg_logs_t ) {
+            $exists = $wpdb->get_var( $wpdb->prepare(
+                "SHOW TABLES LIKE %s", $tg_logs_t
+            ) );
+            if ( ! $exists ) {
+                require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+                dbDelta( "CREATE TABLE {$tg_logs_t} (
+                    id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+                    account_id BIGINT(20) UNSIGNED DEFAULT NULL,
+                    cmms_user_id BIGINT(20) UNSIGNED DEFAULT NULL,
+                    telegram_user_id BIGINT(20) DEFAULT NULL,
+                    task_id BIGINT(20) UNSIGNED DEFAULT NULL,
+                    direction VARCHAR(10) NOT NULL,
+                    kind VARCHAR(40) NOT NULL,
+                    payload LONGTEXT,
+                    response_code INT(11) DEFAULT NULL,
+                    error_text TEXT,
+                    created_at DATETIME NOT NULL,
+                    PRIMARY KEY (id),
+                    KEY account_id (account_id),
+                    KEY telegram_user_id (telegram_user_id),
+                    KEY task_id (task_id),
+                    KEY created_at (created_at)
+                ) $charset;" );
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // 1.14.87: Completion location tracking. Adds 4 columns to
+        // tasks for storing GPS / address of where the task was
+        // completed. NULL for tasks that didn't capture location
+        // (which is most of them, by default).
+        //
+        //   completion_lat / lng       — GPS coords (decimal degrees)
+        //   completion_address         — reverse-geocoded address or
+        //                                "telegram-shared" sentinel
+        //   completion_location_source — 'browser' | 'telegram' | NULL
+        //                                so we can tell where the data
+        //                                came from in reports
+        // ─────────────────────────────────────────────────────────────
+        if ( $tasks_t ) {
+            $cols = $wpdb->get_col( "SHOW COLUMNS FROM $tasks_t", 0 );
+            if ( is_array( $cols ) ) {
+                if ( ! in_array( 'completion_lat', $cols, true ) ) {
+                    $wpdb->query( "ALTER TABLE $tasks_t ADD COLUMN completion_lat DECIMAL(10,7) DEFAULT NULL AFTER completed_at" );
+                }
+                if ( ! in_array( 'completion_lng', $cols, true ) ) {
+                    $wpdb->query( "ALTER TABLE $tasks_t ADD COLUMN completion_lng DECIMAL(10,7) DEFAULT NULL AFTER completion_lat" );
+                }
+                if ( ! in_array( 'completion_address', $cols, true ) ) {
+                    $wpdb->query( "ALTER TABLE $tasks_t ADD COLUMN completion_address VARCHAR(500) DEFAULT NULL AFTER completion_lng" );
+                }
+                if ( ! in_array( 'completion_location_source', $cols, true ) ) {
+                    $wpdb->query( "ALTER TABLE $tasks_t ADD COLUMN completion_location_source VARCHAR(20) DEFAULT NULL AFTER completion_address" );
+                }
+            }
+        }
+
+        // 1.14.85: telegram_task_messages — mapping for in-place edit.
+        $tg_msgs_t = CMMS_DB::table( 'telegram_task_messages' );
+        if ( $tg_msgs_t ) {
+            $exists = $wpdb->get_var( $wpdb->prepare(
+                "SHOW TABLES LIKE %s", $tg_msgs_t
+            ) );
+            if ( ! $exists ) {
+                require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+                dbDelta( "CREATE TABLE {$tg_msgs_t} (
+                    id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+                    account_id BIGINT(20) UNSIGNED NOT NULL,
+                    task_id BIGINT(20) UNSIGNED NOT NULL,
+                    cmms_user_id BIGINT(20) UNSIGNED NOT NULL,
+                    telegram_user_id BIGINT(20) NOT NULL,
+                    chat_id BIGINT(20) NOT NULL,
+                    message_id BIGINT(20) NOT NULL,
+                    last_status VARCHAR(40) DEFAULT NULL,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY task_recipient (task_id, cmms_user_id),
+                    KEY account_id (account_id),
+                    KEY task_id (task_id),
+                    KEY telegram_user_id (telegram_user_id)
+                ) $charset;" );
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // 1.14.83: Soft-delete for tasks. Add deleted_at column +
+        // index. Idempotent — checks if the column already exists
+        // before adding, so re-runs are no-ops.
+        //
+        // The column is NULL for live tasks. Any non-NULL timestamp
+        // means the task has been soft-deleted and should be excluded
+        // from normal queries (list, Kanban, Gantt, Calendar, counters).
+        // ─────────────────────────────────────────────────────────────
+        if ( $tasks_t ) {
+            $cols = $wpdb->get_col( "SHOW COLUMNS FROM $tasks_t", 0 );
+            if ( is_array( $cols ) && ! in_array( 'deleted_at', $cols, true ) ) {
+                $prev_show = $wpdb->show_errors;
+                $wpdb->hide_errors();
+                $wpdb->query( "ALTER TABLE $tasks_t ADD COLUMN deleted_at DATETIME DEFAULT NULL" );
+                $wpdb->query( "ALTER TABLE $tasks_t ADD INDEX deleted_at (deleted_at)" );
+                if ( $prev_show ) $wpdb->show_errors();
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // 1.14.81.3: Retroactively mark existing demo accounts.
+        //
+        // Demo accounts created BEFORE this version went through the
+        // normal signup flow and ended up with subscription_status='trial'
+        // (the default). The dashboard gate then redirected them to the
+        // payment page — making demos unusable for prospects.
+        //
+        // We identify demo accounts by their owner email pattern:
+        //   owner-XXXXXX@cmms-demo.local
+        // (set by CMMS_Demo::create — the @cmms-demo.local domain is
+        // unique to demos and never used elsewhere).
+        //
+        // For matching accounts, update subscription_status to 'demo'
+        // so they bypass the payment gate. Idempotent — safe to re-run.
+        // ─────────────────────────────────────────────────────────────
+        $acc_t = CMMS_DB::table( 'accounts' );
+        if ( $acc_t ) {
+            $users_table = $wpdb->users;
+            $prev_show = $wpdb->show_errors;
+            $wpdb->hide_errors();
+            $wpdb->query(
+                "UPDATE $acc_t a
+                 INNER JOIN $users_table u ON u.ID = a.owner_user_id
+                 SET a.subscription_status = 'demo'
+                 WHERE u.user_email LIKE '%@cmms-demo.local'
+                   AND a.subscription_status != 'demo'"
+            );
+            if ( $prev_show ) $wpdb->show_errors();
+        }
+
+        // 1.14.94: form_submissions grew a source_type column so we can
+        // distinguish public form submissions from webhook API submissions
+        // in reports and logs. dbDelta adds it on activation; backfill
+        // existing rows to 'public_form' (the only source pre-1.14.94).
+        $submissions_t = CMMS_DB::table( 'form_submissions' );
+        if ( $submissions_t ) {
+            $sub_cols = (array) $wpdb->get_col( "SHOW COLUMNS FROM $submissions_t" );
+            if ( ! in_array( 'source_type', $sub_cols, true ) ) {
+                $prev_show = $wpdb->show_errors;
+                $wpdb->hide_errors();
+                $wpdb->query( "ALTER TABLE $submissions_t
+                    ADD COLUMN source_type VARCHAR(20) NOT NULL DEFAULT 'public_form'
+                    AFTER ip_address" );
+                $wpdb->query( "ALTER TABLE $submissions_t ADD KEY source_type (source_type)" );
+                if ( $prev_show ) $wpdb->show_errors();
+            }
+        }
+    }
+
+    /**
+     * 1.14.71: Populate seat fields on the 6 default packages. Idempotent
+     * within the migration — only runs once (option-gated). Uses UPDATE so
+     * it does NOT touch rows the Super Admin has already customised
+     * (Super Admin can edit these values later via packages admin UI).
+     *
+     * Defaults:
+     *   Starter    Monthly/Yearly: included=3,  seat=50, hard_limit=10,  rec_at=80%
+     *   Business   Monthly/Yearly: included=10, seat=50, hard_limit=25,  rec_at=80%
+     *   Enterprise Monthly/Yearly: included=NULL, seat=NULL, hard_limit=NULL (unlimited / custom)
+     *
+     * The UPDATE only fires when the row currently has NULL for the seat
+     * fields — this prevents wiping any Super Admin customisations made
+     * before the backfill option flag was set.
+     */
+    private static function seed_packages_seat_defaults() {
+        global $wpdb;
+        $packages_t = CMMS_DB::table( 'packages' );
+        if ( ! $packages_t ) return;
+
+        // Each entry: plan_type => array(included_seats, seat_addon_price, hard_user_limit, upgrade_recommended_at)
+        $defaults = array(
+            'starter'  => array( 3,    50.00, 10,   80 ),
+            'business' => array( 10,   50.00, 25,   80 ),
+            // Enterprise: NULL everywhere → manual / custom / unlimited.
+        );
+
+        foreach ( $defaults as $plan_type => $vals ) {
+            list( $inc, $price, $limit, $rec_at ) = $vals;
+            $wpdb->query( $wpdb->prepare(
+                "UPDATE $packages_t
+                    SET included_seats = %d,
+                        seat_addon_price = %f,
+                        hard_user_limit = %d,
+                        upgrade_recommended_at = %d
+                  WHERE plan_type = %s
+                    AND included_seats IS NULL",
+                $inc, $price, $limit, $rec_at, $plan_type
+            ) );
+        }
+
+        // Flush plans cache so admin UI sees new values immediately.
+        if ( class_exists( 'CMMS_Plans' ) ) {
+            CMMS_Plans::flush_cache();
+        }
+    }
+
+    /**
+     * 1.14.71: Backfill seats_purchased on existing subscriptions.
+     *
+     * Strategy: for each active subscription, look up the matching
+     * package's included_seats, and the account's max_users. If the
+     * account has more max_users than the package's included_seats,
+     * the difference is seats already paid for — record it as
+     * seats_purchased so the seat status display is accurate.
+     *
+     * Also populates base_amount and seats_amount snapshots so the
+     * Seat Management UI has consistent numbers to show. Computed:
+     *   base_amount  = package.price
+     *   seats_amount = seats_purchased * package.seat_addon_price (if available)
+     *
+     * Idempotent: only touches subscriptions where seats_purchased = 0.
+     */
+    private static function backfill_subscriptions_seats() {
+        global $wpdb;
+        $subs_t     = CMMS_DB::table( 'subscriptions' );
+        $accounts_t = CMMS_DB::table( 'accounts' );
+        $packages_t = CMMS_DB::table( 'packages' );
+        if ( ! $subs_t || ! $accounts_t || ! $packages_t ) return;
+
+        $rows = $wpdb->get_results(
+            "SELECT s.id AS sub_id,
+                    s.account_id,
+                    s.plan_type,
+                    s.billing_cycle,
+                    s.amount,
+                    a.max_users
+               FROM $subs_t s
+               LEFT JOIN $accounts_t a ON a.id = s.account_id
+              WHERE s.seats_purchased = 0
+                AND s.status IN ('active','past_due','canceled_pending','pending_downgrade')",
+            ARRAY_A
+        );
+        if ( empty( $rows ) ) return;
+
+        foreach ( $rows as $row ) {
+            $plan  = $row['plan_type'];
+            $cycle = $row['billing_cycle'] ?: 'monthly';
+            if ( ! $plan ) continue;
+
+            $pkg = $wpdb->get_row( $wpdb->prepare(
+                "SELECT price, included_seats, seat_addon_price
+                   FROM $packages_t
+                  WHERE plan_type = %s AND billing_cycle = %s
+                  LIMIT 1",
+                $plan, $cycle
+            ), ARRAY_A );
+            if ( ! $pkg ) continue;
+
+            $included     = $pkg['included_seats'] !== null ? (int) $pkg['included_seats'] : null;
+            $max_users    = $row['max_users'] !== null ? (int) $row['max_users'] : null;
+            $seat_price   = $pkg['seat_addon_price'] !== null ? (float) $pkg['seat_addon_price'] : null;
+            $base_amount  = (float) $pkg['price'];
+
+            // If either is unknown, we cannot derive seats_purchased
+            // safely — leave the subscription at 0 and let admin set
+            // it manually if needed.
+            if ( $included === null || $max_users === null ) {
+                $wpdb->update(
+                    $subs_t,
+                    array( 'base_amount' => $base_amount ),
+                    array( 'id' => (int) $row['sub_id'] ),
+                    array( '%f' ),
+                    array( '%d' )
+                );
+                continue;
+            }
+
+            $seats_purchased = max( 0, $max_users - $included );
+            $seats_amount    = ( $seat_price !== null ) ? $seats_purchased * $seat_price : 0;
+
+            $wpdb->update(
+                $subs_t,
+                array(
+                    'seats_purchased' => $seats_purchased,
+                    'base_amount'     => $base_amount,
+                    'seats_amount'    => $seats_amount,
+                ),
+                array( 'id' => (int) $row['sub_id'] ),
+                array( '%d', '%f', '%f' ),
+                array( '%d' )
+            );
+        }
     }
 
     /**
@@ -447,8 +931,12 @@ class CMMS_Activator {
                 'display_name'  => 'Starter',
                 'plan_type'     => 'starter',
                 'billing_cycle' => 'monthly',
-                'price'         => 299,
+                'price'         => 290,
                 'max_users'     => 3,
+                'included_seats'         => 3,
+                'seat_addon_price'       => 50,
+                'hard_user_limit'        => 10,
+                'upgrade_recommended_at' => 80,
                 'billing_mode'  => 'recurring',
                 'recommended'   => 0,
                 'custom_price'  => 0,
@@ -463,6 +951,10 @@ class CMMS_Activator {
                 'billing_cycle' => 'yearly',
                 'price'         => 2990,
                 'max_users'     => 3,
+                'included_seats'         => 3,
+                'seat_addon_price'       => 50,
+                'hard_user_limit'        => 10,
+                'upgrade_recommended_at' => 80,
                 'billing_mode'  => 'recurring',
                 'recommended'   => 0,
                 'custom_price'  => 0,
@@ -478,6 +970,10 @@ class CMMS_Activator {
                 'billing_cycle' => 'monthly',
                 'price'         => 690,
                 'max_users'     => 10,
+                'included_seats'         => 10,
+                'seat_addon_price'       => 50,
+                'hard_user_limit'        => 25,
+                'upgrade_recommended_at' => 80,
                 'billing_mode'  => 'recurring',
                 'recommended'   => 1,
                 'custom_price'  => 0,
@@ -492,6 +988,10 @@ class CMMS_Activator {
                 'billing_cycle' => 'yearly',
                 'price'         => 6900,
                 'max_users'     => 10,
+                'included_seats'         => 10,
+                'seat_addon_price'       => 50,
+                'hard_user_limit'        => 25,
+                'upgrade_recommended_at' => 80,
                 'billing_mode'  => 'recurring',
                 'recommended'   => 1,
                 'custom_price'  => 0,
@@ -499,7 +999,8 @@ class CMMS_Activator {
                 'tagline'       => 'הבחירה הנפוצה — לעסקים שצריכים אחזקה מסודרת',
                 'features'      => $features_business,
             ),
-            // Enterprise — custom price, manual only by default
+            // Enterprise — custom price, manual only by default.
+            // Seats are unlimited / custom — keep all seat fields NULL.
             array(
                 'internal_name' => 'enterprise_monthly',
                 'display_name'  => 'Enterprise',
@@ -507,6 +1008,10 @@ class CMMS_Activator {
                 'billing_cycle' => 'monthly',
                 'price'         => 1490,
                 'max_users'     => null,
+                'included_seats'         => null,
+                'seat_addon_price'       => null,
+                'hard_user_limit'        => null,
+                'upgrade_recommended_at' => null,
                 'billing_mode'  => 'manual',
                 'recommended'   => 0,
                 'custom_price'  => 1,
@@ -521,6 +1026,10 @@ class CMMS_Activator {
                 'billing_cycle' => 'yearly',
                 'price'         => 14900,
                 'max_users'     => null,
+                'included_seats'         => null,
+                'seat_addon_price'       => null,
+                'hard_user_limit'        => null,
+                'upgrade_recommended_at' => null,
                 'billing_mode'  => 'manual',
                 'recommended'   => 0,
                 'custom_price'  => 1,

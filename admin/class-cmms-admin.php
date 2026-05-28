@@ -125,6 +125,15 @@ class CMMS_Admin {
             CMMS_Admin_EmailTemplates::SLUG,
             array( 'CMMS_Admin_EmailTemplates', 'render' )
         );
+        // 1.14.84: Telegram Bot integration.
+        add_submenu_page(
+            'cmms-light',
+            __( 'Telegram', 'cmms-light' ),
+            __( 'Telegram', 'cmms-light' ),
+            'manage_options',
+            CMMS_Admin_Telegram::SLUG,
+            array( 'CMMS_Admin_Telegram', 'render' )
+        );
     }
 
     public function handle_actions() {

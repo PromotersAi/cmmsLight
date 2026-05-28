@@ -116,7 +116,59 @@ class CMMS_Icredit {
             return new WP_Error( 'invalid_input', 'בקשת תשלום שגויה.' );
         }
 
-        $amount = (float) $package['price'];
+        // 1.14.74: charge_type controls how Items[] and Amount are built.
+        //   'initial'    → onboarding signup (base + seats together)
+        //   'seat_addon' → existing customer buying more seats (prorated,
+        //                  one Item only, $params['amount'] is authoritative)
+        //   default treats as 'initial' for backward compatibility.
+        $charge_type = isset( $params['charge_type'] ) ? sanitize_key( $params['charge_type'] ) : 'initial';
+
+        // 1.14.73: Seat-aware pricing. The caller passes the seat count
+        // chosen by the customer (or 0 to mean "use included only"). We
+        // compute:
+        //   base_amount    = package.price
+        //   extras_count   = max(0, users - included_seats)
+        //   extras_amount  = extras_count × seat_addon_price
+        //   total_amount   = base_amount + extras_amount
+        //
+        // The total is what iCredit sees. We also send TWO Items[] entries
+        // when seats are added — base + seat add-on — so the invoice
+        // breaks down clearly for the customer. If there are no extras,
+        // we send a single Item to keep invoices identical to pre-1.14.73.
+        //
+        // For Enterprise / unmanaged plans (included_seats=NULL), seats
+        // logic is bypassed entirely and we just charge the base price
+        // — exactly the 1.14.72.x behaviour.
+        //
+        // 1.14.74: For charge_type='seat_addon', this whole block is
+        // bypassed and we use $params['amount'] directly (it's prorated).
+        $base_amount   = (float) $package['price'];
+        $included      = isset( $package['included_seats'] )   ? $package['included_seats']   : null;
+        $seat_price    = isset( $package['seat_addon_price'] ) ? $package['seat_addon_price'] : null;
+        $supports_seats = ( $included !== null && $seat_price !== null );
+
+        $requested_users = (int) ( $params['users'] ?? 0 );
+        $extras_count    = 0;
+        $extras_amount   = 0.0;
+
+        if ( $charge_type === 'seat_addon' ) {
+            // Self-service seat addon — amount is prorated and passed
+            // in by the caller. seats_added carries how many seats this
+            // payment is for, which the IPN handler reads from the
+            // payment row to credit the subscription.
+            $extras_count  = (int) ( $params['seats_added'] ?? 0 );
+            $amount        = (float) ( $params['amount'] ?? 0 );
+            $extras_amount = $amount;
+            $base_amount   = 0.0; // no base charge for an addon
+        } else {
+            // Initial onboarding — calculate from package + users.
+            if ( $supports_seats && $requested_users > $included ) {
+                $extras_count  = $requested_users - $included;
+                $extras_amount = $extras_count * (float) $seat_price;
+            }
+            $amount = $base_amount + $extras_amount;
+        }
+
         if ( $amount <= 0 ) {
             return new WP_Error( 'no_price',
                 'התשלום לחבילה זו עדיין לא הוגדר. ניתן לפנות אלינו להשלמת פתיחת החשבון.' );
@@ -162,6 +214,17 @@ class CMMS_Icredit {
                 'plan_type'          => $package['plan_type'] ?? null,
                 'billing_cycle'      => $package['billing_cycle'] ?? null,
                 'amount'             => $amount,
+                // 1.14.73: also record the seat count and the per-seat
+                // price snapshot, so the IPN handler can credit the right
+                // number of seats to the subscription when the payment
+                // succeeds. seats_added is also useful for accounting
+                // when invoicing the customer.
+                'seats_added'        => $extras_count,
+                // 1.14.74: persist the charge_type from the start. The
+                // IPN handler dispatches by this field — 'seat_addon'
+                // goes through apply_paid_addon, 'initial' through
+                // activate_from_payment.
+                'charge_type'        => $charge_type,
                 'currency'           => $package['currency'] ?? 'ILS',
                 'status'             => 'pending',
                 'provider'           => 'icredit',
@@ -223,15 +286,46 @@ class CMMS_Icredit {
             $package['billing_cycle'] === 'yearly' ? 'שנתי' : 'חודשי'
         );
 
+        // 1.14.73: when seats were added, send TWO line items so the
+        // invoice clearly breaks down base + add-on. Otherwise a single
+        // item (matches pre-1.14.73 behaviour exactly).
+        //
+        // 1.14.74: when charge_type='seat_addon', send a single item
+        // describing the addon — no base. This produces a clean invoice
+        // for the prorated charge.
+        $items = array();
+        if ( $charge_type === 'seat_addon' ) {
+            $items[] = array(
+                'Description' => sprintf(
+                    'תוספת %d משתמשים — עלות יחסית לתקופה שנותרה',
+                    $extras_count
+                ),
+                'Quantity'    => 1,
+                'UnitPrice'   => round( $amount, 2 ),
+            );
+        } else {
+            $items[] = array(
+                'Description' => $item_description,
+                'Quantity'    => 1,
+                'UnitPrice'   => round( $base_amount, 2 ),
+            );
+            if ( $extras_count > 0 && $extras_amount > 0 ) {
+                $seat_description = sprintf(
+                    'תוספת משתמשים — %d × ₪%s',
+                    $extras_count,
+                    rtrim( rtrim( number_format( (float) $seat_price, 2 ), '0' ), '.' )
+                );
+                $items[] = array(
+                    'Description' => $seat_description,
+                    'Quantity'    => 1,
+                    'UnitPrice'   => round( $extras_amount, 2 ),
+                );
+            }
+        }
+
         $payload = array(
             'GroupPrivateToken' => self::active_token(),
-            'Items'             => array(
-                array(
-                    'Description' => $item_description,
-                    'Quantity'    => 1,
-                    'UnitPrice'   => round( $amount, 2 ),
-                ),
-            ),
+            'Items'             => $items,
             'RedirectURL'       => self::return_url(),
             'IPNURL'            => self::ipn_url(),
             // 1.14.66: Critical mapping (see comment above):
@@ -266,10 +360,17 @@ class CMMS_Icredit {
             // subscription row, so when the page id is added later we
             // can hook the next iCredit recurring webhook to the right
             // subscription.
-            'SaleType'          => (
-                ( ( $package['billing_mode'] ?? '' ) === 'recurring' )
-                && ! empty( $package['icredit_page_id'] )
-            ) ? 6 : 1,
+            //
+            // 1.14.74: For charge_type='seat_addon', always use SaleType=1
+            // — these are one-time prorated charges that should not
+            // create a new recurring subscription. The recurring update
+            // happens manually by Super Admin in iCredit dashboard.
+            'SaleType'          => ( $charge_type === 'seat_addon' )
+                ? 1
+                : ( (
+                        ( ( $package['billing_mode'] ?? '' ) === 'recurring' )
+                        && ! empty( $package['icredit_page_id'] )
+                    ) ? 6 : 1 ),
             'Order'             => (string) $payment_id,
             // Carry our payment_id and account_id back in custom fields
             // so the IPN handler can match the webhook to our row even
@@ -296,17 +397,54 @@ class CMMS_Icredit {
             $payload['HostedPagePrivateToken'] = $package['icredit_page_id'];
         }
 
+        // 1.14.79.1: Build a sanitized snapshot of the payload that's
+        // safe to persist for debugging. Redacts the GroupPrivateToken
+        // (auth credential) and truncates the HostedPagePrivateToken.
+        // Everything else stays — Items, SaleType, Currency, Custom*,
+        // billing contact, etc. — so we can see exactly what we sent
+        // when a customer reports "I got Error.htm at rivhit.net".
+        $debug_payload_snapshot = array(
+            'GroupPrivateToken' => '***REDACTED***',
+            'Items'             => $payload['Items'] ?? null,
+            'RedirectURL'       => $payload['RedirectURL'] ?? null,
+            'IPNURL'            => $payload['IPNURL'] ?? null,
+            'FirstName'         => $payload['FirstName'] ?? null,
+            'LastName'          => $payload['LastName'] ?? null,
+            'Email'             => $payload['Email'] ?? null,
+            'PhoneNumber'       => $payload['PhoneNumber'] ?? null,
+            'SaleType'          => $payload['SaleType'] ?? null,
+            'Order'             => $payload['Order'] ?? null,
+            'Custom1'           => $payload['Custom1'] ?? null,
+            'Custom2'           => $payload['Custom2'] ?? null,
+            'Custom3'           => $payload['Custom3'] ?? null,
+            'Currency'          => $payload['Currency'] ?? null,
+            'HostedPagePrivateToken' => isset( $payload['HostedPagePrivateToken'] )
+                ? substr( $payload['HostedPagePrivateToken'], 0, 8 ) . '...'
+                : '(empty)',
+        );
+
         $url = self::api_base() . 'GetUrl';
+        $request_start_ts = microtime( true );
         $response = wp_remote_post( $url, array(
             'timeout' => 20,
             'headers' => array( 'Content-Type' => 'application/json' ),
             'body'    => wp_json_encode( $payload ),
         ) );
+        $request_duration_ms = (int) round( ( microtime( true ) - $request_start_ts ) * 1000 );
 
         if ( is_wp_error( $response ) ) {
             self::log_payment_error( $payment_id, 'http_error', array(
                 'wp_error_message' => $response->get_error_message(),
                 'request_url'      => $url,
+            ) );
+            // 1.14.79.1: also persist debug snapshot for HTTP failures.
+            self::save_debug_payload( $payment_id, array(
+                'attempted_at'    => current_time( 'mysql' ),
+                'request_url'     => $url,
+                'request_payload' => $debug_payload_snapshot,
+                'http_outcome'    => 'wp_error',
+                'wp_error'        => $response->get_error_message(),
+                'duration_ms'     => $request_duration_ms,
             ) );
             return new WP_Error( 'icredit_unreachable',
                 'לא הצלחנו ליצור קשר עם שירות התשלום. נסה שוב בעוד מספר רגעים.' );
@@ -315,6 +453,23 @@ class CMMS_Icredit {
         $code = wp_remote_retrieve_response_code( $response );
         $body = wp_remote_retrieve_body( $response );
         $data = json_decode( $body, true );
+
+        // 1.14.79.1: persist debug payload for the SUCCESSFUL path too.
+        // The whole point of this is to capture failures that happen
+        // AFTER we get a valid URL — when the customer lands on
+        // rivhit.net and the page itself rejects (Error.htm). Those
+        // failures don't trigger log_payment_error and previously left
+        // no record of what we sent.
+        self::save_debug_payload( $payment_id, array(
+            'attempted_at'    => current_time( 'mysql' ),
+            'request_url'     => $url,
+            'request_payload' => $debug_payload_snapshot,
+            'http_outcome'    => 'response_received',
+            'http_code'       => $code,
+            'response_body'   => substr( (string) $body, 0, 4000 ),
+            'response_parsed' => is_array( $data ) ? $data : null,
+            'duration_ms'     => $request_duration_ms,
+        ) );
 
         if ( $code < 200 || $code >= 300 || ! is_array( $data ) ) {
             self::log_payment_error( $payment_id, 'bad_response', array(
@@ -565,6 +720,61 @@ class CMMS_Icredit {
                         }
                     }
                     // Done — skip the regular activate_from_payment path.
+                } elseif ( ( $payment_fresh['charge_type'] ?? '' ) === 'seat_addon' ) {
+                    // 1.14.74: Self-service seat addon. The customer
+                    // already had an active subscription; this payment
+                    // is the prorated charge for adding more seats. We
+                    // do NOT call activate_from_payment (that would
+                    // reset their billing cycle). Instead, route to
+                    // CMMS_Seats::apply_paid_addon which:
+                    //   - bumps seats_purchased on the subscription
+                    //   - sets pending_seats_change = +N (super admin reminder)
+                    //   - syncs accounts.max_users
+                    //
+                    // Errors are logged but the IPN must still 200 OK
+                    // to iCredit — the customer already paid, refusing
+                    // the IPN would only cause retries and confusion.
+                    $seats_added = (int) ( $payment_fresh['seats_added'] ?? 0 );
+                    if ( $seats_added > 0 && class_exists( 'CMMS_Seats' ) ) {
+                        $apply_res = CMMS_Seats::apply_paid_addon(
+                            (int) $payment_fresh['account_id'],
+                            $seats_added
+                        );
+                        if ( is_wp_error( $apply_res ) ) {
+                            error_log( 'CMMS Seats: apply_paid_addon failed for payment ' . $payment_fresh['id'] . ': ' . $apply_res->get_error_message() );
+                        } elseif ( class_exists( 'CMMS_Mailer' ) ) {
+                            // 1.14.75 — Phase 5: send the customer
+                            // confirmation, and notify the site admin
+                            // that the iCredit recurring needs manual
+                            // update. Errors inside the mailer log only,
+                            // never bubble — the customer already paid.
+                            $amount_paid = (float) ( $payment_fresh['amount'] ?? 0 );
+                            CMMS_Mailer::send_seats_purchased(
+                                (int) $payment_fresh['account_id'],
+                                $seats_added,
+                                $amount_paid
+                            );
+                            CMMS_Mailer::send_admin_seats_alert(
+                                (int) $payment_fresh['account_id'],
+                                $seats_added,
+                                $amount_paid
+                            );
+                        }
+                    }
+
+                    // Link payment to the existing subscription if any,
+                    // for the Payment History view.
+                    $sub_t_addon = CMMS_DB::table( 'subscriptions' );
+                    $existing_sub_id = $wpdb->get_var( $wpdb->prepare(
+                        "SELECT id FROM $sub_t_addon WHERE account_id = %d LIMIT 1",
+                        (int) $payment_fresh['account_id']
+                    ) );
+                    if ( $existing_sub_id ) {
+                        $wpdb->update( $payments_t,
+                            array( 'subscription_id' => (int) $existing_sub_id ),
+                            array( 'id' => $payment['id'] )
+                        );
+                    }
                 } elseif ( class_exists( 'CMMS_Subscriptions' ) ) {
                     // 1.14.56: also pass the RecurringId from this IPN so
                     // we can store it on the subscription row. Without it,
@@ -593,7 +803,12 @@ class CMMS_Icredit {
                 // a second email. Errors here are logged inside the
                 // mailer and never bubble up; we don't want a failing
                 // wp_mail to break the payment confirmation flow.
-                if ( class_exists( 'CMMS_Mailer' ) ) {
+                //
+                // 1.14.74: skip welcome on seat_addon payments — the
+                // customer is an existing one and has already received
+                // the welcome email when they signed up.
+                if ( class_exists( 'CMMS_Mailer' )
+                     && ( $payment_fresh['charge_type'] ?? '' ) !== 'seat_addon' ) {
                     CMMS_Mailer::send_welcome( (int) $payment['account_id'] );
                 }
             }
@@ -726,6 +941,38 @@ class CMMS_Icredit {
             exit;
         }
 
+        // 1.14.74: For seat_addon payments (existing customers buying
+        // more seats), the new-customer onboarding animation is wrong —
+        // they already have an account. Route them straight to their
+        // dashboard with a ?seats_added=N URL parameter that triggers
+        // the success toast on arrival.
+        if ( ( $payment['charge_type'] ?? '' ) === 'seat_addon' ) {
+            $seats_added = (int) ( $payment['seats_added'] ?? 0 );
+            if ( $payment['status'] === 'approved' ) {
+                wp_safe_redirect( add_query_arg(
+                    'seats_added',
+                    $seats_added,
+                    home_url( '/cmms-dashboard/?view=users' )
+                ) );
+                exit;
+            }
+            if ( $payment['status'] === 'declined' ) {
+                wp_safe_redirect( add_query_arg(
+                    'seats_failed',
+                    '1',
+                    home_url( '/cmms-dashboard/?view=users' )
+                ) );
+                exit;
+            }
+            // Pending — go back to users page; IPN will catch up.
+            wp_safe_redirect( add_query_arg(
+                'seats_pending',
+                '1',
+                home_url( '/cmms-dashboard/?view=users' )
+            ) );
+            exit;
+        }
+
         // 1.14.47: For approved/pending, route through the Workspace
         // Animation step (step 4) instead of dropping the user directly
         // on the dashboard. This gives a SaaS-grade post-payment
@@ -776,6 +1023,35 @@ class CMMS_Icredit {
             array( '%s', '%s', '%s' ),
             array( '%d' )
         );
+    }
+
+    /**
+     * 1.14.79.1 — Save a debug snapshot of the iCredit request/response
+     * onto the payment row. Used to retrospectively diagnose failures
+     * that happened AFTER iCredit returned a valid URL (i.e. customer
+     * lands on rivhit.net and the hosted page rejects without sending
+     * an IPN, so log_payment_error never fires).
+     *
+     * Idempotent in the sense that multiple writes to the same payment
+     * row just overwrite each other — the latest attempt wins. That's
+     * what we want for retries.
+     */
+    private static function save_debug_payload( $payment_id, $debug ) {
+        if ( ! $payment_id ) return;
+        global $wpdb;
+        $payments_t = CMMS_DB::table( 'payments' );
+        $json = wp_json_encode( $debug, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT );
+        if ( ! $json ) return;
+        $prev = $wpdb->show_errors;
+        $wpdb->hide_errors();
+        $wpdb->update(
+            $payments_t,
+            array( 'debug_payload' => $json ),
+            array( 'id' => (int) $payment_id ),
+            array( '%s' ),
+            array( '%d' )
+        );
+        if ( $prev ) $wpdb->show_errors();
     }
 
     /**

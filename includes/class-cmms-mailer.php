@@ -130,6 +130,204 @@ class CMMS_Mailer {
         return false;
     }
 
+    /* ============================================================
+       1.14.75 — Phase 5: Email Triggers
+
+       These methods are called from the subscription lifecycle:
+         - send_past_due()             → record_recurring_failure()
+         - send_frozen()               → process_grace_expirations()
+         - send_subscription_canceled() → subscriptions::cancel()
+         - send_seats_purchased()      → CMMS_Seats::apply_paid_addon() — to customer
+         - send_admin_seats_alert()    → CMMS_Seats::apply_paid_addon() — to admin
+
+       All share a common shape:
+         1. Resolve account → owner email + display name + package.
+         2. Build $vars dict for the template.
+         3. Call send_templated().
+
+       To avoid duplicating the lookup code, we factor it into
+       resolve_account_context().
+    ============================================================ */
+
+    /**
+     * Helper: pull the account, owner, package, and subscription rows
+     * needed to render any account-level email. Returns null if any
+     * required piece is missing (caller can't send the email anyway).
+     *
+     * Returns:
+     *   array(
+     *     'account'      => array,   // cmms_accounts row
+     *     'owner'        => array,   // cmms_users + wpu joined (has 'email')
+     *     'package'      => array|null,
+     *     'subscription' => array|null,
+     *     'vars'         => array,   // ready-to-use template variables
+     *   )
+     *   or null on failure.
+     */
+    private static function resolve_account_context( $account_id ) {
+        $account_id = (int) $account_id;
+        if ( $account_id <= 0 ) return null;
+
+        global $wpdb;
+        $accounts_t = CMMS_DB::table( 'accounts' );
+        $users_t    = CMMS_DB::table( 'users' );
+
+        $account = $wpdb->get_row( $wpdb->prepare(
+            "SELECT * FROM $accounts_t WHERE id = %d",
+            $account_id
+        ), ARRAY_A );
+        if ( ! $account ) return null;
+
+        $owner = $wpdb->get_row( $wpdb->prepare(
+            "SELECT cu.*, wpu.user_email AS email, wpu.display_name AS wp_display_name
+             FROM $users_t cu
+             LEFT JOIN {$wpdb->users} wpu ON wpu.ID = cu.wp_user_id
+             WHERE cu.id = %d",
+            (int) $account['owner_user_id']
+        ), ARRAY_A );
+        if ( ! $owner || empty( $owner['email'] ) ) return null;
+
+        $package = null;
+        if ( ! empty( $account['plan_type'] ) && ! empty( $account['billing_cycle'] ) ) {
+            $package = CMMS_Plans::get_package( $account['plan_type'], $account['billing_cycle'] );
+        }
+        $package_name = $package ? $package['display_name'] : ( ucfirst( $account['plan_type'] ?? '' ) ?: '—' );
+        $cycle_label  = ( ( $account['billing_cycle'] ?? '' ) === 'yearly' ) ? 'שנתי' : 'חודשי';
+
+        $display_name = trim( (string) ( $owner['display_name'] ?? '' ) );
+        if ( $display_name === '' ) $display_name = trim( (string) ( $owner['wp_display_name'] ?? '' ) );
+        if ( $display_name === '' ) $display_name = 'לקוח/ה';
+
+        $next_payment_date = '';
+        $sub = null;
+        if ( class_exists( 'CMMS_Subscriptions' ) ) {
+            $sub = CMMS_Subscriptions::for_account( $account_id );
+            if ( $sub && ! empty( $sub['next_charge_at'] ) ) {
+                $next_payment_date = mysql2date( 'd/m/Y', $sub['next_charge_at'] );
+            }
+        }
+
+        return array(
+            'account'      => $account,
+            'owner'        => $owner,
+            'package'      => $package,
+            'subscription' => $sub,
+            'vars'         => array(
+                'FULL_NAME'         => $display_name,
+                'COMPANY_NAME'      => $account['name'] ?? '—',
+                'PACKAGE_NAME'      => $package_name,
+                'BILLING_CYCLE'     => $cycle_label,
+                'NEXT_PAYMENT_DATE' => $next_payment_date,
+                'USER_EMAIL'        => $owner['email'],
+                'DASHBOARD_URL'     => home_url( '/cmms-dashboard/' ),
+                'SUPPORT_EMAIL'     => 'guy@promoters.co.il',
+                'SITE_URL'          => home_url( '/' ),
+            ),
+        );
+    }
+
+    /**
+     * Past-due notification — recurring charge failed at iCredit.
+     * Sent immediately after the failure IPN. The customer is in a
+     * 7-day grace period before the account freezes.
+     *
+     * Idempotent at the call site (lifecycle code only calls this once
+     * per failure transition).
+     */
+    public static function send_past_due( $account_id ) {
+        $ctx = self::resolve_account_context( $account_id );
+        if ( ! $ctx ) return false;
+
+        // Compute grace_until display.
+        $grace_label = '';
+        if ( $ctx['subscription'] && ! empty( $ctx['subscription']['grace_until'] ) ) {
+            $grace_label = mysql2date( 'd/m/Y', $ctx['subscription']['grace_until'] );
+        }
+        $vars = $ctx['vars'];
+        $vars['NEXT_PAYMENT_DATE'] = $grace_label !== '' ? $grace_label : $vars['NEXT_PAYMENT_DATE'];
+
+        return self::send_templated( 'past_due', $ctx['owner']['email'], $vars );
+    }
+
+    /**
+     * Frozen notification — grace period ran out without a successful
+     * charge. The account is now blocked from the dashboard until
+     * the customer pays again. Sent once when the cron transitions
+     * past_due → frozen.
+     */
+    public static function send_frozen( $account_id ) {
+        $ctx = self::resolve_account_context( $account_id );
+        if ( ! $ctx ) return false;
+        return self::send_templated( 'frozen', $ctx['owner']['email'], $ctx['vars'] );
+    }
+
+    /**
+     * Subscription cancellation confirmation. Sent when the customer
+     * clicks "Cancel" in the dashboard. Confirms the recurring is
+     * canceled at iCredit and the account stays active until the
+     * end of the current paid period.
+     */
+    public static function send_subscription_canceled( $account_id ) {
+        $ctx = self::resolve_account_context( $account_id );
+        if ( ! $ctx ) return false;
+        return self::send_templated( 'subscription_canceled', $ctx['owner']['email'], $ctx['vars'] );
+    }
+
+    /**
+     * Seats purchased — confirmation to the customer that the
+     * prorated charge succeeded and N new seats are active.
+     */
+    public static function send_seats_purchased( $account_id, $seats_added, $amount_paid ) {
+        $ctx = self::resolve_account_context( $account_id );
+        if ( ! $ctx ) return false;
+
+        $vars = $ctx['vars'];
+        $vars['SEATS_ADDED']  = (int) $seats_added;
+        $vars['AMOUNT_PAID']  = '₪' . number_format( (float) $amount_paid, 2 );
+        // New total: included + purchased (after this addon).
+        $sub = $ctx['subscription'];
+        if ( $sub ) {
+            $vars['NEW_TOTAL_USERS'] = (int) ( ( $ctx['package']['included_seats'] ?? 0 ) + ( $sub['seats_purchased'] ?? 0 ) );
+        }
+
+        return self::send_templated( 'seats_purchased', $ctx['owner']['email'], $vars );
+    }
+
+    /**
+     * Admin notification — sent to the site administrator when a
+     * customer self-purchases additional seats. Tells the admin
+     * the iCredit recurring needs to be updated manually.
+     *
+     * Recipient: WordPress 'admin_email' option (the site admin's
+     * address as set in Settings → General).
+     */
+    public static function send_admin_seats_alert( $account_id, $seats_added, $amount_paid ) {
+        $admin_email = get_option( 'admin_email' );
+        if ( ! is_email( $admin_email ) ) return false;
+
+        $ctx = self::resolve_account_context( $account_id );
+        if ( ! $ctx ) return false;
+
+        // Compute the new recurring amount for clarity in the alert.
+        $sub = $ctx['subscription'];
+        $new_recurring = 0;
+        if ( $ctx['package'] && $sub ) {
+            $new_recurring = (float) $ctx['package']['price']
+                           + (int) $sub['seats_purchased']
+                             * (float) ( $ctx['package']['seat_addon_price'] ?: 0 );
+        }
+        $external_id = $sub['external_subscription_id'] ?? '—';
+
+        $vars = $ctx['vars'];
+        $vars['SEATS_ADDED']      = (int) $seats_added;
+        $vars['AMOUNT_PAID']      = '₪' . number_format( (float) $amount_paid, 2 );
+        $vars['NEW_RECURRING']    = '₪' . number_format( $new_recurring, 2 );
+        $vars['RECURRING_ID']     = $external_id;
+        $vars['ADMIN_PANEL_URL']  = admin_url( 'admin.php?page=cmms-payments-subscriptions&tab=subscriptions' );
+
+        return self::send_templated( 'admin_seats_alert', $admin_email, $vars );
+    }
+
     /**
      * 1.14.59: Generic templated send.
      *

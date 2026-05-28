@@ -125,6 +125,106 @@ class CMMS_Attachments {
         return $name;
     }
 
+    /**
+     * 1.15.6: Attach a file that already exists on disk (NOT an HTTP
+     * upload). Used for email-to-task attachments, which the email
+     * inbox writes to a temp path via file_put_contents — these are
+     * not $_FILES entries, so wp_handle_upload() (which calls
+     * move_uploaded_file internally) would reject them.
+     *
+     * This mirrors the validation in handle_upload (extension check,
+     * mime check, random stored name) but moves the file with a plain
+     * rename/copy instead of move_uploaded_file.
+     *
+     * @param int    $account_id
+     * @param string $object_type  'task'
+     * @param int    $object_id
+     * @param string $src_path     Absolute path to the source file on disk
+     * @param string $original_name Original filename (for display + ext)
+     * @param int|null $uploaded_by
+     * @return int|WP_Error  attachment id or error
+     */
+    public static function handle_upload_from_path( $account_id, $object_type, $object_id, $src_path, $original_name, $uploaded_by = null ) {
+        if ( ! file_exists( $src_path ) ) {
+            return new WP_Error( 'no_file', __( 'Source file missing', 'cmms-light' ) );
+        }
+
+        $size = filesize( $src_path );
+        if ( $size === false || $size > self::MAX_BYTES ) {
+            return new WP_Error( 'too_large', __( 'File too large (max 10 MB).', 'cmms-light' ) );
+        }
+
+        // Sanitize and verify filename / extension.
+        $original_name = sanitize_file_name( basename( $original_name ) );
+        if ( $original_name === '' || strpos( $original_name, '..' ) !== false ) {
+            return new WP_Error( 'bad_name', __( 'Invalid filename.', 'cmms-light' ) );
+        }
+
+        $ext = strtolower( pathinfo( $original_name, PATHINFO_EXTENSION ) );
+        if ( $ext === '' ) {
+            return new WP_Error( 'no_ext', __( 'File has no extension.', 'cmms-light' ) );
+        }
+
+        // Block dangerous extensions (incl. hidden double-extensions).
+        $name_only = pathinfo( $original_name, PATHINFO_FILENAME );
+        $blocked = self::blocked_extensions();
+        if ( in_array( $ext, $blocked, true ) ) {
+            return new WP_Error( 'blocked_ext', __( 'File type not allowed.', 'cmms-light' ) );
+        }
+        foreach ( explode( '.', strtolower( $name_only ) ) as $part ) {
+            if ( in_array( $part, $blocked, true ) ) {
+                return new WP_Error( 'blocked_ext', __( 'File type not allowed.', 'cmms-light' ) );
+            }
+        }
+
+        // Real-content mime check via WP core (reads the file bytes).
+        if ( ! function_exists( 'wp_check_filetype_and_ext' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+        }
+        $checked = wp_check_filetype_and_ext( $src_path, $original_name, self::allowed_mimes() );
+        if ( empty( $checked['ext'] ) || empty( $checked['type'] ) ) {
+            return new WP_Error( 'mime_mismatch', __( 'File type not allowed.', 'cmms-light' ) );
+        }
+
+        // Build destination dir (same custom dir used for uploads).
+        $upload = wp_upload_dir();
+        $dest_dir = $upload['basedir'] . '/cmms-light';
+        if ( ! is_dir( $dest_dir ) ) {
+            wp_mkdir_p( $dest_dir );
+        }
+
+        // Random stored name (never trust user-supplied name on disk).
+        $safe_name = wp_generate_uuid4() . '.' . $checked['ext'];
+        $dest_path = $dest_dir . '/' . $safe_name;
+        $dest_url  = $upload['baseurl'] . '/cmms-light/' . $safe_name;
+
+        // Move the file. rename() is atomic on the same filesystem;
+        // fall back to copy+unlink across mounts.
+        if ( ! @rename( $src_path, $dest_path ) ) {
+            if ( ! @copy( $src_path, $dest_path ) ) {
+                return new WP_Error( 'move_failed', __( 'Could not store file', 'cmms-light' ) );
+            }
+            @unlink( $src_path );
+        }
+
+        global $wpdb;
+        $table = CMMS_DB::table( 'attachments' );
+        $wpdb->insert( $table, array(
+            'account_id'   => intval( $account_id ),
+            'object_type'  => sanitize_text_field( $object_type ),
+            'object_id'    => intval( $object_id ),
+            'file_name'    => $safe_name,
+            'original_name'=> $original_name,
+            'file_url'     => esc_url_raw( $dest_url ),
+            'file_path'    => $dest_path,
+            'mime_type'    => sanitize_text_field( $checked['type'] ),
+            'uploaded_by'  => $uploaded_by ? intval( $uploaded_by ) : null,
+            'created_at'   => current_time( 'mysql' ),
+        ), array( '%d','%s','%d','%s','%s','%s','%s','%s','%d','%s' ) );
+
+        return $wpdb->insert_id;
+    }
+
     public static function custom_upload_dir( $dirs ) {
         $dirs['subdir'] = '/cmms-light';
         $dirs['path']   = $dirs['basedir'] . '/cmms-light';
@@ -156,6 +256,93 @@ class CMMS_Attachments {
 
     public static function is_image( $att ) {
         return $att && strpos( (string) $att->mime_type, 'image/' ) === 0;
+    }
+
+    /**
+     * 1.14.86: Save a file that we downloaded from a remote source
+     * (e.g., Telegram photo). The bytes are already in memory or on
+     * a temp path — this method handles the writing + DB row.
+     *
+     * Unlike handle_upload() (which works with $_FILES from the
+     * browser), this one accepts:
+     *   $bytes     — the file content as a string
+     *   $extension — file extension (e.g. 'jpg', 'png')
+     *   $original_name — what to show the user (e.g. 'IMG_telegram.jpg')
+     *   $mime_type — content type
+     *
+     * Returns the new attachment id, or WP_Error.
+     */
+    public static function handle_remote_file( $account_id, $object_type, $object_id, $bytes, $extension, $original_name, $mime_type, $uploaded_by = null ) {
+        if ( empty( $bytes ) ) {
+            return new WP_Error( 'empty', __( 'No file data', 'cmms-light' ) );
+        }
+        if ( strlen( $bytes ) > self::MAX_BYTES ) {
+            return new WP_Error( 'too_large', __( 'File too large (max 10 MB).', 'cmms-light' ) );
+        }
+
+        $extension = strtolower( ltrim( $extension, '.' ) );
+        if ( in_array( $extension, self::blocked_extensions(), true ) ) {
+            return new WP_Error( 'blocked_ext', __( 'File type not allowed.', 'cmms-light' ) );
+        }
+
+        // Map extension → allowed mime; reject if not in our list.
+        $allowed = self::allowed_mimes();
+        $mime_ok = false;
+        foreach ( $allowed as $ext_group => $allowed_mime ) {
+            if ( in_array( $extension, explode( '|', $ext_group ), true ) ) {
+                $mime_ok = true;
+                break;
+            }
+        }
+        if ( ! $mime_ok ) {
+            return new WP_Error( 'mime_not_allowed', __( 'File type not allowed.', 'cmms-light' ) );
+        }
+
+        // Build the destination path in our upload subdir.
+        if ( ! function_exists( 'wp_upload_dir' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+        }
+        add_filter( 'upload_dir', array( __CLASS__, 'custom_upload_dir' ) );
+        $upload_dir = wp_upload_dir();
+        remove_filter( 'upload_dir', array( __CLASS__, 'custom_upload_dir' ) );
+
+        if ( ! empty( $upload_dir['error'] ) ) {
+            return new WP_Error( 'upload_dir', $upload_dir['error'] );
+        }
+
+        // Ensure the directory exists.
+        if ( ! wp_mkdir_p( $upload_dir['path'] ) ) {
+            return new WP_Error( 'mkdir', __( 'Could not create upload directory.', 'cmms-light' ) );
+        }
+
+        // Randomize stored filename, like handle_upload does.
+        $safe_name = wp_generate_uuid4() . '.' . $extension;
+        $disk_path = trailingslashit( $upload_dir['path'] ) . $safe_name;
+        $disk_url  = trailingslashit( $upload_dir['url'] )  . $safe_name;
+
+        // Write bytes atomically (best effort).
+        $written = file_put_contents( $disk_path, $bytes );
+        if ( $written === false || $written === 0 ) {
+            return new WP_Error( 'write_failed', __( 'Could not write file.', 'cmms-light' ) );
+        }
+
+        // Insert DB row.
+        global $wpdb;
+        $table = CMMS_DB::table( 'attachments' );
+        $wpdb->insert( $table, array(
+            'account_id'   => intval( $account_id ),
+            'object_type'  => sanitize_text_field( $object_type ),
+            'object_id'    => intval( $object_id ),
+            'file_name'    => $safe_name,
+            'original_name'=> sanitize_file_name( $original_name ),
+            'file_url'     => esc_url_raw( $disk_url ),
+            'file_path'    => $disk_path,
+            'mime_type'    => sanitize_text_field( $mime_type ),
+            'uploaded_by'  => $uploaded_by ? intval( $uploaded_by ) : null,
+            'created_at'   => current_time( 'mysql' ),
+        ), array( '%d','%s','%d','%s','%s','%s','%s','%s','%d','%s' ) );
+
+        return $wpdb->insert_id;
     }
 
     /**

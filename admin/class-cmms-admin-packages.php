@@ -289,11 +289,63 @@ class CMMS_Admin_Packages {
                     </tr>
 
                     <tr>
-                        <th scope="row"><label for="max_users"><?php esc_html_e( 'Max Users', 'cmms-light' ); ?></label></th>
+                        <th scope="row"><label for="max_users"><?php esc_html_e( 'Max Users (legacy)', 'cmms-light' ); ?></label></th>
                         <td>
                             <input name="max_users" id="max_users" type="number" min="0" class="small-text"
                                    value="<?php echo $p['max_users'] === null ? '' : esc_attr( $p['max_users'] ); ?>">
-                            <p class="description"><?php esc_html_e( 'Leave empty for unlimited (Enterprise).', 'cmms-light' ); ?></p>
+                            <p class="description"><?php esc_html_e( 'Legacy field. Leave empty for unlimited (Enterprise). Use the Seat fields below for modern seat-based packages.', 'cmms-light' ); ?></p>
+                        </td>
+                    </tr>
+
+                    <!-- ─────────────────────────────────────────────
+                         1.14.71 — Seat configuration
+
+                         These four fields drive the seat-based pricing
+                         model. Leave them empty for Enterprise/custom
+                         packages (no seat semantics).
+                         ───────────────────────────────────────────── -->
+                    <tr>
+                        <th scope="row" colspan="2" style="background:#f6f7f7;border-top:2px solid #c3c4c7;padding-top:14px;">
+                            <h3 style="margin:0;font-size:14px;color:#0b1c33;"><?php esc_html_e( 'Seat-Based Pricing (1.14.71+)', 'cmms-light' ); ?></h3>
+                            <p class="description" style="font-weight:normal;margin-top:4px;">
+                                <?php esc_html_e( 'Modern seat-based packages. Customers pay the base price for "included_seats" users, and can purchase extras at "seat_addon_price" each, up to "hard_user_limit".', 'cmms-light' ); ?>
+                            </p>
+                        </th>
+                    </tr>
+
+                    <tr>
+                        <th scope="row"><label for="included_seats"><?php esc_html_e( 'Included Seats', 'cmms-light' ); ?></label></th>
+                        <td>
+                            <input name="included_seats" id="included_seats" type="number" min="0" class="small-text"
+                                   value="<?php echo ( isset( $p['included_seats'] ) && $p['included_seats'] !== null ) ? esc_attr( $p['included_seats'] ) : ''; ?>">
+                            <p class="description"><?php esc_html_e( 'How many users are included in the base price. E.g. Starter=3, Business=10. Empty = Enterprise/unmanaged.', 'cmms-light' ); ?></p>
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <th scope="row"><label for="seat_addon_price"><?php esc_html_e( 'Seat Add-on Price', 'cmms-light' ); ?></label></th>
+                        <td>
+                            <input name="seat_addon_price" id="seat_addon_price" type="number" step="0.01" min="0" class="small-text"
+                                   value="<?php echo ( isset( $p['seat_addon_price'] ) && $p['seat_addon_price'] !== null ) ? esc_attr( $p['seat_addon_price'] ) : ''; ?>">
+                            <p class="description"><?php esc_html_e( 'Price per additional seat per cycle (monthly or yearly, matching this package). E.g. 50 = ₪50 per seat per month for monthly packages.', 'cmms-light' ); ?></p>
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <th scope="row"><label for="hard_user_limit"><?php esc_html_e( 'Hard User Limit', 'cmms-light' ); ?></label></th>
+                        <td>
+                            <input name="hard_user_limit" id="hard_user_limit" type="number" min="0" class="small-text"
+                                   value="<?php echo ( isset( $p['hard_user_limit'] ) && $p['hard_user_limit'] !== null ) ? esc_attr( $p['hard_user_limit'] ) : ''; ?>">
+                            <p class="description"><?php esc_html_e( 'Absolute ceiling — customers cannot exceed this even with paid seats. E.g. Starter=10, Business=25. Empty = unlimited.', 'cmms-light' ); ?></p>
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <th scope="row"><label for="upgrade_recommended_at"><?php esc_html_e( 'Upgrade Recommended At (%)', 'cmms-light' ); ?></label></th>
+                        <td>
+                            <input name="upgrade_recommended_at" id="upgrade_recommended_at" type="number" min="0" max="100" class="small-text"
+                                   value="<?php echo ( isset( $p['upgrade_recommended_at'] ) && $p['upgrade_recommended_at'] !== null ) ? esc_attr( $p['upgrade_recommended_at'] ) : ''; ?>">
+                            <p class="description"><?php esc_html_e( 'Show "upgrade recommended" prompt when current users reach this % of hard_user_limit. E.g. 80 = warning at 80% capacity.', 'cmms-light' ); ?></p>
                         </td>
                     </tr>
 
@@ -446,6 +498,14 @@ class CMMS_Admin_Packages {
             'billing_cycle'         => isset( $_POST['billing_cycle'] ) ? sanitize_key( wp_unslash( $_POST['billing_cycle'] ) ) : 'monthly',
             'price'                 => isset( $_POST['price'] ) ? (float) $_POST['price'] : 0,
             'max_users'             => ( isset( $_POST['max_users'] ) && $_POST['max_users'] !== '' ) ? (int) $_POST['max_users'] : null,
+
+            // 1.14.71: seat fields. Empty form values become NULL (not 0)
+            // so Enterprise/custom packages stay "unmanaged" properly.
+            'included_seats'         => ( isset( $_POST['included_seats'] )         && $_POST['included_seats']         !== '' ) ? (int)   $_POST['included_seats']         : null,
+            'seat_addon_price'       => ( isset( $_POST['seat_addon_price'] )       && $_POST['seat_addon_price']       !== '' ) ? (float) $_POST['seat_addon_price']       : null,
+            'hard_user_limit'        => ( isset( $_POST['hard_user_limit'] )        && $_POST['hard_user_limit']        !== '' ) ? (int)   $_POST['hard_user_limit']        : null,
+            'upgrade_recommended_at' => ( isset( $_POST['upgrade_recommended_at'] ) && $_POST['upgrade_recommended_at'] !== '' ) ? (int)   $_POST['upgrade_recommended_at'] : null,
+
             'billing_mode'          => isset( $_POST['billing_mode'] ) ? sanitize_key( wp_unslash( $_POST['billing_mode'] ) ) : 'recurring',
             'icredit_page_id'       => isset( $_POST['icredit_page_id'] ) ? sanitize_text_field( wp_unslash( $_POST['icredit_page_id'] ) ) : '',
             'external_payment_reference' => isset( $_POST['external_payment_reference'] ) ? sanitize_text_field( wp_unslash( $_POST['external_payment_reference'] ) ) : '',
@@ -501,21 +561,21 @@ class CMMS_Admin_Packages {
             exit;
         }
 
-        // Build format array matching $data order. nullable fields use
-        // %s with explicit null; wpdb handles that correctly.
-        // Order: internal_name, display_name, plan_type, billing_cycle,
-        //   price, max_users, billing_mode, icredit_page_id,
-        //   external_payment_reference (1.14.40), success/failure/cancel
-        //   redirects, sort_order, tagline, is_active, show_on_pricing,
-        //   manual_only, recommended, custom_price, updated_at, features
-        $format = array(
-            '%s','%s','%s','%s','%f',
-            $data['max_users'] === null ? null : '%d',
-            '%s','%s','%s','%s','%s','%s','%d','%s',
-            '%d','%d','%d','%d','%d','%s','%s',
-        );
-
-        $wpdb->update( $t, $data, array( 'id' => $id ), $format, array( '%d' ) );
+        // 1.14.71: We pass NULL for empty seat fields (and max_users) to
+        // preserve the "unmanaged" state for Enterprise packages. wpdb's
+        // format array doesn't handle null gracefully — if we set %d on
+        // a null value, it gets coerced to 0. Solution: separate nullable
+        // values into a dedicated raw query path, OR just call $wpdb->query
+        // with a prepared statement we build manually.
+        //
+        // Simplest fix: don't pass a format array (use type-coerced strings),
+        // and let wpdb skip null values. Tested against MySQL 5.7+ / MariaDB.
+        $result = $wpdb->update( $t, $data, array( 'id' => $id ) );
+        if ( $result === false ) {
+            // Surface DB-level errors during development; in production
+            // wpdb hides them but we can still log via the catch-all.
+            error_log( 'CMMS Admin Packages save failed: ' . ( $wpdb->last_error ?: 'unknown' ) );
+        }
         CMMS_Plans::flush_cache();
 
         // Post-Redirect-Get to prevent re-submission on browser refresh.

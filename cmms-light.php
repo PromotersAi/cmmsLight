@@ -3,7 +3,7 @@
  * Plugin Name: CMMS Light
  * Plugin URI: https://example.com/cmms-light
  * Description: A complete Computerized Maintenance Management System (CMMS) with multi-tenant accounts, tasks, assets, forms, and PWA support.
- * Version: 1.14.70
+ * Version: 1.15.11
  * Author: CMMS Light
  * License: GPL-2.0+
  * Text Domain: cmms-light
@@ -13,7 +13,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'CMMS_LIGHT_VERSION', '1.14.70' );
+define( 'CMMS_LIGHT_VERSION', '1.15.11' );
 define( 'CMMS_LIGHT_FILE', __FILE__ );
 define( 'CMMS_LIGHT_DIR', plugin_dir_path( __FILE__ ) );
 define( 'CMMS_LIGHT_URL', plugin_dir_url( __FILE__ ) );
@@ -42,12 +42,26 @@ require_once CMMS_LIGHT_DIR . 'includes/class-cmms-pwa.php';
 require_once CMMS_LIGHT_DIR . 'includes/class-cmms-whitelabel.php';
 require_once CMMS_LIGHT_DIR . 'includes/class-cmms-help.php';
 require_once CMMS_LIGHT_DIR . 'includes/class-cmms-plans.php';
+require_once CMMS_LIGHT_DIR . 'includes/class-cmms-seats.php';
 require_once CMMS_LIGHT_DIR . 'includes/class-cmms-subscriptions.php';
 require_once CMMS_LIGHT_DIR . 'includes/class-cmms-email-templates.php';
 require_once CMMS_LIGHT_DIR . 'includes/class-cmms-mailer.php';
 require_once CMMS_LIGHT_DIR . 'includes/class-cmms-plan-changes.php';
 require_once CMMS_LIGHT_DIR . 'includes/class-cmms-icredit.php';
 require_once CMMS_LIGHT_DIR . 'includes/class-cmms-checklist.php';
+// 1.14.87: Per-account task lifecycle settings
+require_once CMMS_LIGHT_DIR . 'includes/class-cmms-task-settings.php';
+// 1.14.88: Help Center / FAQ chatbot
+require_once CMMS_LIGHT_DIR . 'includes/class-cmms-help-center.php';
+// 1.14.94: Webhook API for external integrations
+require_once CMMS_LIGHT_DIR . 'includes/class-cmms-webhook.php';
+// 1.14.98: Email-to-task — receive forwarded emails as JSON
+require_once CMMS_LIGHT_DIR . 'includes/class-cmms-email-inbox.php';
+// 1.15.3: Task signatures — customer/technician sign-off on tasks
+require_once CMMS_LIGHT_DIR . 'includes/class-cmms-signatures.php';
+// 1.14.84: Telegram bot integration
+require_once CMMS_LIGHT_DIR . 'includes/class-cmms-telegram.php';
+require_once CMMS_LIGHT_DIR . 'includes/class-cmms-telegram-webhook.php';
 require_once CMMS_LIGHT_DIR . 'includes/class-cmms-shortcodes.php';
 require_once CMMS_LIGHT_DIR . 'includes/class-cmms-ajax.php';
 require_once CMMS_LIGHT_DIR . 'vendor/simplexlsx/SimpleXLSX.php';
@@ -57,6 +71,8 @@ require_once CMMS_LIGHT_DIR . 'admin/class-cmms-admin-packages.php';
 require_once CMMS_LIGHT_DIR . 'admin/class-cmms-admin-icredit.php';
 require_once CMMS_LIGHT_DIR . 'admin/class-cmms-admin-payments.php';
 require_once CMMS_LIGHT_DIR . 'admin/class-cmms-admin-email-templates.php';
+// 1.14.84: Telegram admin settings
+require_once CMMS_LIGHT_DIR . 'admin/class-cmms-admin-telegram.php';
 require_once CMMS_LIGHT_DIR . 'public/class-cmms-public.php';
 require_once CMMS_LIGHT_DIR . 'includes/class-cmms-plugin.php';
 

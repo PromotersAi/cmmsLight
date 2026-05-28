@@ -63,12 +63,41 @@ class CMMS_Subscriptions {
         $now = current_time( 'mysql' );
         $next_charge = self::compute_next_charge( $payment_row['billing_cycle'] ?? 'monthly', $now );
 
+        // 1.14.73: capture seats info from the payment row. The payment
+        // was created with seats_added = max(0, users - included_seats)
+        // when iCredit::create_sale was called. Total amount already
+        // reflects base + extras, so we just need to break it back down
+        // for the subscription's snapshot fields.
+        $seats_purchased = (int) ( $payment_row['seats_added'] ?? 0 );
+        $total_amount    = (float) ( $payment_row['amount'] ?? 0 );
+
+        // Look up the package to derive base_amount vs seats_amount.
+        // Falls back to total if package can't be found (shouldn't happen).
+        $base_amount  = $total_amount;
+        $seats_amount = 0.0;
+        if ( class_exists( 'CMMS_Plans' ) && ! empty( $payment_row['plan_type'] ) ) {
+            $pkg = CMMS_Plans::get_package(
+                $payment_row['plan_type'],
+                $payment_row['billing_cycle'] ?? 'monthly'
+            );
+            if ( $pkg ) {
+                $base_amount = (float) $pkg['price'];
+                if ( $seats_purchased > 0 && $pkg['seat_addon_price'] !== null ) {
+                    $seats_amount = $seats_purchased * (float) $pkg['seat_addon_price'];
+                }
+            }
+        }
+
         $data = array(
             'account_id'      => $account_id,
             'package_id'      => isset( $payment_row['package_id'] ) ? (int) $payment_row['package_id'] : null,
             'plan_type'       => $payment_row['plan_type'] ?? null,
             'billing_cycle'   => $payment_row['billing_cycle'] ?? null,
-            'amount'          => (float) ( $payment_row['amount'] ?? 0 ),
+            'amount'          => $total_amount,
+            // 1.14.73: snapshot of the price breakdown for billing UI.
+            'base_amount'     => $base_amount,
+            'seats_amount'    => $seats_amount,
+            'seats_purchased' => $seats_purchased,
             'currency'        => $payment_row['currency'] ?? 'ILS',
             'provider'        => 'icredit',
             'status'          => 'active',
@@ -96,6 +125,13 @@ class CMMS_Subscriptions {
             $data['created_at'] = $now;
             $wpdb->insert( $t, $data );
             $sub_id = (int) $wpdb->insert_id;
+        }
+
+        // 1.14.73: keep accounts.max_users in sync with the subscription's
+        // seat state. CMMS_Seats does the math: included + purchased.
+        // For Enterprise / unmanaged plans, this is a no-op.
+        if ( class_exists( 'CMMS_Seats' ) ) {
+            CMMS_Seats::sync_account_max_users( $account_id );
         }
 
         self::sync_account_status( $account_id, 'active' );
@@ -155,6 +191,13 @@ class CMMS_Subscriptions {
         ), array( 'id' => (int) $sub['id'] ) );
 
         self::sync_account_status( (int) $account_id, 'past_due' );
+
+        // 1.14.75 — Phase 5: notify customer that their recurring failed.
+        // The mailer is best-effort (logs failures internally), so we
+        // don't gate the lifecycle transition on it.
+        if ( class_exists( 'CMMS_Mailer' ) ) {
+            CMMS_Mailer::send_past_due( (int) $account_id );
+        }
     }
 
     /**
@@ -182,6 +225,13 @@ class CMMS_Subscriptions {
                 'updated_at' => $now,
             ), array( 'id' => (int) $row['id'] ) );
             self::sync_account_status( (int) $row['account_id'], 'frozen' );
+
+            // 1.14.75 — Phase 5: notify customer that their account
+            // has been frozen (grace period expired). Per-row send
+            // so a failure on one account doesn't block the others.
+            if ( class_exists( 'CMMS_Mailer' ) ) {
+                CMMS_Mailer::send_frozen( (int) $row['account_id'] );
+            }
         }
     }
 
@@ -203,6 +253,13 @@ class CMMS_Subscriptions {
             'updated_at'          => $now,
         ), array( 'id' => (int) $sub['id'] ) );
         self::sync_account_status( (int) $account_id, 'canceled' );
+
+        // 1.14.75 — Phase 5: confirmation email after cancellation.
+        // Customer keeps access until end of paid period (handled
+        // elsewhere); the email confirms the recurring is canceled.
+        if ( class_exists( 'CMMS_Mailer' ) ) {
+            CMMS_Mailer::send_subscription_canceled( (int) $account_id );
+        }
     }
 
     /**

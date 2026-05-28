@@ -681,12 +681,18 @@
 		if (!cfg) return;
 
 		var tbody    = root.querySelector('[data-cmms-bulk-body]');
+		var thead    = root.querySelector('[data-cmms-bulk-head]');
+		var formSel  = document.querySelector('[data-cmms-bulk-form-select]');
 		var addBtn   = document.querySelector('[data-cmms-bulk-add]');
 		var saveBtn  = document.querySelector('[data-cmms-bulk-save]');
 		var resultEl = document.querySelector('[data-cmms-bulk-result]');
 
 		// State: array of row objects. Each row is what we'll send to the server.
 		var rows = [];
+		// 1.14.90: when a form is selected, its fields become extra columns
+		// on every row. selectedForm caches the form object from cfg.forms
+		// so render/save can stay fast without re-looking-it-up.
+		var selectedForm = null;
 		var INITIAL_ROWS = 30;
 		var ADD_BATCH    = 50;
 
@@ -698,13 +704,70 @@
 				priority: 'normal',
 				assigned_to: '',
 				due_date: '',
+				// 1.14.90: keyed by form field id (as string) when a form
+				// is selected. Survives form-changes — we only ever ADD
+				// keys; old keys stick around in case the user switches
+				// back. (Storage is cheap; user trust is not.)
+				form_fields: {},
 				error: '', // last validation error for inline display
 			};
 		}
 
 		function init() {
 			for (var i = 0; i < INITIAL_ROWS; i++) rows.push(blankRow());
+
+			// 1.14.90: wire up the form picker. Changing the form re-renders
+			// the grid with extra columns; existing row data is preserved
+			// because we never touch the standard fields and only add to
+			// row.form_fields on user edits.
+			if (formSel) {
+				formSel.addEventListener('change', function () {
+					var fid = parseInt(formSel.value, 10);
+					selectedForm = null;
+					if (!isNaN(fid) && fid && cfg.forms) {
+						for (var i = 0; i < cfg.forms.length; i++) {
+							if (cfg.forms[i].id === fid) { selectedForm = cfg.forms[i]; break; }
+						}
+					}
+					// 1.14.90: surface "form has no fields" as an inline
+					// notice — picking a form and seeing nothing change is
+					// the worst failure mode of this feature, so we name it.
+					var hintEl = document.querySelector('.cmms-bulk-form-hint');
+					if (hintEl) {
+						if (selectedForm && (!selectedForm.fields || selectedForm.fields.length === 0)) {
+							hintEl.textContent = '⚠ ' + (cfg.i18n.form_empty || 'This form has no fields yet — add fields to the form first.');
+							hintEl.style.color = '#b91c1c';
+						} else {
+							hintEl.textContent = cfg.i18n.form_hint || '';
+							hintEl.style.color = '';
+						}
+					}
+					renderHead();
+					render();
+				});
+			}
+
+			renderHead();
 			render();
+		}
+
+		// 1.14.90: Rebuild the thead to match the current column set. The
+		// first 7 <th>s are static (the # column + the 6 base columns
+		// rendered server-side); we append one <th> per form field.
+		function renderHead() {
+			if (!thead) return;
+			// Remove any previously-appended dynamic columns
+			var dyn = thead.querySelectorAll('[data-cmms-bulk-th-form]');
+			for (var i = 0; i < dyn.length; i++) dyn[i].parentNode.removeChild(dyn[i]);
+			if (!selectedForm) return;
+			for (var j = 0; j < selectedForm.fields.length; j++) {
+				var fld = selectedForm.fields[j];
+				var th = document.createElement('th');
+				th.setAttribute('data-cmms-bulk-th-form', String(fld.id));
+				th.className = 'cmms-bulk-th-form-field';
+				th.textContent = fld.label;
+				thead.appendChild(th);
+			}
 		}
 
 		// Render the entire tbody. Cheap because we have at most ~1000 rows
@@ -721,15 +784,88 @@
 		function renderRow(idx, row) {
 			var rowClass = 'cmms-bulk-row';
 			if (row.error) rowClass += ' cmms-bulk-row-error';
-			return '<tr class="' + rowClass + '" data-row="' + idx + '">' +
+			var html = '<tr class="' + rowClass + '" data-row="' + idx + '">' +
 				'<td class="cmms-bulk-td-num">' + (idx + 1) + '</td>' +
 				'<td>' + inputCell(idx, 'title', row.title, 'text') + '</td>' +
 				'<td>' + inputCell(idx, 'description', row.description, 'text') + '</td>' +
 				'<td>' + assetSelect(idx, row.asset_id) + '</td>' +
 				'<td>' + prioritySelect(idx, row.priority) + '</td>' +
 				'<td>' + assigneeSelect(idx, row.assigned_to) + '</td>' +
-				'<td>' + inputCell(idx, 'due_date', row.due_date, 'date') + '</td>' +
-				'</tr>';
+				'<td>' + inputCell(idx, 'due_date', row.due_date, 'date') + '</td>';
+			// 1.14.90: form-field cells
+			if (selectedForm) {
+				for (var f = 0; f < selectedForm.fields.length; f++) {
+					html += '<td>' + formFieldCell(idx, selectedForm.fields[f], row) + '</td>';
+				}
+			}
+			html += '</tr>';
+			return html;
+		}
+
+		// 1.14.90: render the appropriate input/select for a form field.
+		// Field types map straight from the form designer:
+		//   text     -> <input type="text">
+		//   textarea -> <input type="text">  (kept single-line in the grid;
+		//               long content is still saved verbatim. A textarea
+		//               in a grid row hurts paste-from-Excel.)
+		//   date     -> <input type="date">
+		//   dropdown -> <select> of options
+		//   checkbox -> <select> for multi (joined) or single yes/no.
+		//               We use a select rather than a real checkbox so that
+		//               paste-from-Excel still works (Excel writes a string,
+		//               not a tri-state).
+		//   file     -> disabled cell with explanation. Files don't belong
+		//               in a bulk grid (no upload UX; no paste analog).
+		function formFieldCell(idx, fld, row) {
+			var key = String(fld.id);
+			var val = row.form_fields && row.form_fields[key] != null ? row.form_fields[key] : '';
+			var safe = String(val == null ? '' : val).replace(/"/g, '&quot;');
+			var dataAttrs = 'data-row="' + idx + '" data-field="form_' + fld.id + '" data-form-field-id="' + fld.id + '" data-form-field-type="' + esc(fld.field_type) + '"';
+
+			if (fld.field_type === 'file') {
+				return '<input type="text" class="cmms-bulk-input cmms-bulk-input-disabled" ' +
+					'disabled ' +
+					'placeholder="' + esc(cfg.i18n.file_unsupported) + '" ' +
+					dataAttrs + '>';
+			}
+			if (fld.field_type === 'date') {
+				return '<input type="date" class="cmms-bulk-input" ' + dataAttrs + ' value="' + safe + '">';
+			}
+			if (fld.field_type === 'dropdown') {
+				var opts = '<option value="">' + esc(cfg.i18n.select_value) + '</option>';
+				for (var i = 0; i < fld.options.length; i++) {
+					var o = fld.options[i];
+					var sel = (String(o) === String(val)) ? ' selected' : '';
+					opts += '<option value="' + esc(o) + '"' + sel + '>' + esc(o) + '</option>';
+				}
+				return '<select class="cmms-bulk-input" ' + dataAttrs + '>' + opts + '</select>';
+			}
+			if (fld.field_type === 'checkbox') {
+				if (fld.options && fld.options.length) {
+					// Multi-checkbox in the public form. In the bulk grid
+					// we expose it as a single-choice dropdown — picking
+					// multiple values per row would need a complex UI that
+					// doesn't survive paste-from-Excel. Power users who
+					// need multi can edit the task post-creation.
+					var opts2 = '<option value="">' + esc(cfg.i18n.select_value) + '</option>';
+					for (var j = 0; j < fld.options.length; j++) {
+						var o2 = fld.options[j];
+						var sel2 = (String(o2) === String(val)) ? ' selected' : '';
+						opts2 += '<option value="' + esc(o2) + '"' + sel2 + '>' + esc(o2) + '</option>';
+					}
+					return '<select class="cmms-bulk-input" ' + dataAttrs + '>' + opts2 + '</select>';
+				}
+				// Single yes/no checkbox -> 3-state dropdown (blank/yes/no)
+				var yesSel = (val === '1') ? ' selected' : '';
+				var noSel  = (val === '0') ? ' selected' : '';
+				return '<select class="cmms-bulk-input" ' + dataAttrs + '>' +
+					'<option value=""></option>' +
+					'<option value="1"' + yesSel + '>Yes</option>' +
+					'<option value="0"' + noSel + '>No</option>' +
+					'</select>';
+			}
+			// text + textarea (and any unknown future type) -> plain text input
+			return '<input type="text" class="cmms-bulk-input" ' + dataAttrs + ' value="' + safe + '">';
 		}
 
 		function inputCell(idx, field, value, type) {
@@ -790,7 +926,16 @@
 			var rowIdx = parseInt(t.dataset.row, 10);
 			var field = t.dataset.field;
 			if (isNaN(rowIdx) || !rows[rowIdx]) return;
-			rows[rowIdx][field] = t.value;
+			// 1.14.90: form-field cells live in row.form_fields, keyed by
+			// the form field's numeric id. Everything else is a top-level
+			// row property as before.
+			if (field && field.indexOf('form_') === 0) {
+				var fldId = t.dataset.formFieldId || field.substring(5);
+				if (!rows[rowIdx].form_fields) rows[rowIdx].form_fields = {};
+				rows[rowIdx].form_fields[String(fldId)] = t.value;
+			} else {
+				rows[rowIdx][field] = t.value;
+			}
 			// Clear inline error when user edits
 			if (rows[rowIdx].error) {
 				rows[rowIdx].error = '';
@@ -805,7 +950,15 @@
 			var t = e.target;
 			if (!t || !t.dataset) return;
 			var rowIdx = parseInt(t.dataset.row, 10);
-			var isLastInput = t.dataset.field === 'due_date';
+			// 1.14.90: the "last cell" is the last form-field column when
+			// a form is selected; otherwise it's still 'due_date'.
+			var isLastInput;
+			if (selectedForm && selectedForm.fields.length) {
+				var lastFld = selectedForm.fields[selectedForm.fields.length - 1];
+				isLastInput = (t.dataset.field === 'form_' + lastFld.id);
+			} else {
+				isLastInput = (t.dataset.field === 'due_date');
+			}
 			if (rowIdx === rows.length - 1 && isLastInput) {
 				rows.push(blankRow());
 				render();
@@ -818,37 +971,75 @@
 		function onPaste(e) {
 			var t = e.target;
 			if (!t || !t.dataset || t.dataset.row === undefined) return;
+
 			var clip = e.clipboardData || window.clipboardData;
 			if (!clip) return;
 			var text = clip.getData('text/plain');
 			if (!text) return;
 
-			// Detect: is this a multi-cell paste from a spreadsheet?
-			// A spreadsheet paste contains tab characters (column separators)
-			// and/or newline characters (row separators). If neither, this is
-			// a normal single-value paste — let the browser handle it.
-			var hasGrid = text.indexOf('\t') !== -1 || /[\r\n]/.test(text);
-			if (!hasGrid) return;
+			// 1.14.93: Always split clipboard content into rows (the
+			// original 1.14.88 behavior). The bug that made us regress this
+			// in 1.14.89 was that a long Excel cell containing internal
+			// newlines (entered via Alt+Enter) looked identical to a
+			// multi-row paste, so the splitter would over-create tasks.
+			//
+			// The fix is not to suppress splitting — it's to PARSE the
+			// clipboard the way Excel actually emits it. When a cell
+			// contains a newline or a tab or a double-quote, Excel wraps
+			// the whole cell in double quotes and escapes inner quotes as
+			// "". This is the standard TSV convention, identical to CSV
+			// with a tab delimiter.
+			//
+			// So we use a proper TSV parser: it walks character-by-character
+			// and treats newlines INSIDE quotes as cell content, but
+			// newlines OUTSIDE quotes as row separators. Excel cells with
+			// Alt+Enter therefore stay in their original row.
+			//
+			// Non-Excel sources (Word, plain text editors) typically don't
+			// quote anything. For those, every newline is a row separator,
+			// which is the desired behaviour for "paste a column of values
+			// from anywhere".
+			//
+			// Single-cell pastes with no newlines/tabs are still passed to
+			// the browser's default handler (so users can normal-paste a
+			// value into one cell without us interfering).
+			var hasTab = text.indexOf('\t') !== -1;
+			var hasNewline = /[\r\n]/.test(text);
+			var hasQuote = text.indexOf('"') !== -1;
+
+			// No row/column separators at all — let the browser paste
+			// normally into the focused input.
+			if (!hasTab && !hasNewline && !hasQuote) return;
+			// A quoted blob with no real separators is still single-cell.
+			if (!hasTab && !hasNewline && hasQuote) return;
 
 			e.preventDefault();
 			var startRow = parseInt(t.dataset.row, 10);
 			var startCol = colIndexOf(t.dataset.field);
 			if (isNaN(startRow) || startCol === -1) return;
 
-			// Normalize line endings, drop a trailing empty row if any
-			var lines = text.replace(/\r\n?/g, '\n').replace(/\n+$/, '').split('\n');
+			// Parse the clipboard text as TSV (tab-separated values with
+			// quote escaping). Result is a 2-D array of cells.
+			var matrix = parseTSV(text);
 			var fields = colOrder();
 
-			for (var i = 0; i < lines.length; i++) {
+			for (var i = 0; i < matrix.length; i++) {
 				var targetRow = startRow + i;
 				while (rows.length <= targetRow) rows.push(blankRow());
-				var cells = lines[i].split('\t');
+				var cells = matrix[i];
 				for (var j = 0; j < cells.length; j++) {
 					var targetCol = startCol + j;
 					if (targetCol >= fields.length) break;
 					var field = fields[targetCol];
 					var value = cells[j];
-					rows[targetRow][field] = transformPasteValue(field, value);
+					var clean = transformPasteValue(field, value);
+					// 1.14.90: route form-field pastes into row.form_fields
+					if (field.indexOf('form_') === 0) {
+						if (!rows[targetRow].form_fields) rows[targetRow].form_fields = {};
+						rows[targetRow].form_fields[field.substring(5)] = clean;
+					} else {
+						rows[targetRow][field] = clean;
+					}
 				}
 				rows[targetRow].error = '';
 			}
@@ -856,9 +1047,114 @@
 			focusCell(startRow, t.dataset.field);
 		}
 
-		// Column order matches the visible grid: title, description, asset, priority, assignee, due
+		// 1.14.93: TSV parser that respects Excel's quoting convention.
+		// When a cell contains a tab, newline, or double-quote, Excel wraps
+		// it in double quotes ("...") and doubles any internal quote ("" ).
+		// We walk the input character by character, tracking whether we're
+		// inside a quoted region. Newlines/tabs inside quotes go into the
+		// current cell; outside they end the cell/row.
+		//
+		// Input examples:
+		//   plain     ->  hello\tworld\n  =>  [["hello","world"]]
+		//   quoted    ->  "a\nb"\tc\n     =>  [["a\nb","c"]]
+		//   escaped " ->  "a""b"          =>  [['a"b']]
+		//   one col   ->  alpha\nbeta\n   =>  [["alpha"],["beta"]]
+		function parseTSV(input) {
+			// Normalise CRLF/CR to LF first; saves the parser from dealing
+			// with both forms.
+			input = String(input).replace(/\r\n?/g, '\n');
+
+			var matrix = [];
+			var row = [];
+			var cell = '';
+			var inQuotes = false;
+			var i = 0;
+			var len = input.length;
+
+			while (i < len) {
+				var ch = input.charAt(i);
+
+				if (inQuotes) {
+					if (ch === '"') {
+						// Look ahead: "" means an escaped quote inside the
+						// quoted field. A lone " ends the quoted region.
+						if (i + 1 < len && input.charAt(i + 1) === '"') {
+							cell += '"';
+							i += 2;
+							continue;
+						}
+						inQuotes = false;
+						i++;
+						continue;
+					}
+					// Any other char (including \n and \t) is literal content.
+					cell += ch;
+					i++;
+					continue;
+				}
+
+				// Not currently inside quotes:
+				if (ch === '"') {
+					// Opens a quoted region. We only honor the quote as
+					// "structural" when it appears at the START of a cell;
+					// a stray quote mid-value is treated as literal so
+					// users who paste text containing measurements like
+					// 5"7" don't get confused parsing.
+					if (cell === '') {
+						inQuotes = true;
+						i++;
+						continue;
+					}
+					cell += ch;
+					i++;
+					continue;
+				}
+				if (ch === '\t') {
+					row.push(cell);
+					cell = '';
+					i++;
+					continue;
+				}
+				if (ch === '\n') {
+					row.push(cell);
+					matrix.push(row);
+					row = [];
+					cell = '';
+					i++;
+					continue;
+				}
+				cell += ch;
+				i++;
+			}
+
+			// Flush trailing cell/row (handles input without final newline)
+			if (cell !== '' || row.length > 0) {
+				row.push(cell);
+				matrix.push(row);
+			}
+
+			// Drop a single trailing empty row that often comes from Excel
+			// ending its copy with \n. We only drop ONE — multiple blank
+			// rows in the middle are kept verbatim (the user may want them).
+			if (matrix.length > 0) {
+				var last = matrix[matrix.length - 1];
+				if (last.length === 1 && last[0] === '') matrix.pop();
+			}
+
+			return matrix;
+		}
+
+		// Column order matches the visible grid: title, description, asset, priority, assignee, due.
+		// 1.14.90: when a form is selected, its fields extend the order so
+		// pasting from Excel can fill them just like the base columns.
 		function colOrder() {
-			return ['title', 'description', 'asset_id', 'priority', 'assigned_to', 'due_date'];
+			var base = ['title', 'description', 'asset_id', 'priority', 'assigned_to', 'due_date'];
+			if (selectedForm && selectedForm.fields) {
+				for (var i = 0; i < selectedForm.fields.length; i++) {
+					base.push('form_' + selectedForm.fields[i].id);
+				}
+			}
+			return base;
 		}
 		function colIndexOf(field) {
 			return colOrder().indexOf(field);
@@ -937,9 +1233,19 @@
 		});
 
 		function isRowEmpty(row) {
-			return !row.title && !row.description && !row.asset_id &&
-			       !row.assigned_to && !row.due_date &&
-			       (row.priority === 'normal' || !row.priority);
+			if (row.title || row.description || row.asset_id ||
+			    row.assigned_to || row.due_date) return false;
+			if (row.priority && row.priority !== 'normal') return false;
+			// 1.14.90: a row with form-field values is not empty
+			if (row.form_fields) {
+				for (var k in row.form_fields) {
+					if (Object.prototype.hasOwnProperty.call(row.form_fields, k)) {
+						var v = row.form_fields[k];
+						if (v != null && String(v).trim() !== '') return false;
+					}
+				}
+			}
+			return true;
 		}
 
 		function save() {
@@ -949,14 +1255,31 @@
 			var indexMap = []; // payload index -> rows array index
 			for (var i = 0; i < rows.length; i++) {
 				if (isRowEmpty(rows[i])) continue;
-				payload.push({
+				var rowPayload = {
 					title: rows[i].title,
 					description: rows[i].description,
 					asset_id: rows[i].asset_id || '',
 					priority: rows[i].priority || 'normal',
 					assigned_to: rows[i].assigned_to || '',
 					due_date: rows[i].due_date || '',
-				});
+				};
+				// 1.14.90: ship form-field values only when a form is
+				// selected. Old keys lingering in form_fields from a
+				// previously-chosen form are intentionally dropped here —
+				// they'd be meaningless (and confusing) on the server.
+				if (selectedForm && rows[i].form_fields) {
+					var ff = {};
+					var hasAny = false;
+					for (var f = 0; f < selectedForm.fields.length; f++) {
+						var fid = String(selectedForm.fields[f].id);
+						if (rows[i].form_fields[fid] != null && String(rows[i].form_fields[fid]).trim() !== '') {
+							ff[fid] = rows[i].form_fields[fid];
+							hasAny = true;
+						}
+					}
+					if (hasAny) rowPayload.form_fields = ff;
+				}
+				payload.push(rowPayload);
 				indexMap.push(i);
 			}
 			if (payload.length === 0) return;
@@ -966,11 +1289,15 @@
 			resultEl.hidden = true;
 			resultEl.className = '';
 
+			var body = { nonce: cfg.nonce, rows: payload };
+			// 1.14.90: tell the server which form's fields are in form_fields
+			if (selectedForm) body.form_id = selectedForm.id;
+
 			fetch(cfg.endpoint, {
 				method: 'POST',
 				credentials: 'same-origin',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ nonce: cfg.nonce, rows: payload }),
+				body: JSON.stringify(body),
 			}).then(function (r) {
 				return r.json();
 			}).then(function (data) {
@@ -1814,4 +2141,139 @@
 			if (e.key === 'Escape' && !modal.hidden) closeModal();
 		});
 	});
+})();
+
+/* ============================================================
+   Upload progress / double-submit guard (1.15.4)
+
+   Problem: forms with file uploads (task create/edit, attachment
+   upload) can take several seconds on mobile — a phone photo is
+   5-12MB and cellular upload is slow. With no feedback, users
+   think the page froze, so they either:
+     - close/refresh the page (losing the submission), or
+     - tap "Save" repeatedly (creating duplicate tasks).
+
+   Fix: intercept submit on any multipart form, disable the submit
+   button, swap its label to a spinner + "saving...", and show a
+   full-screen overlay telling the user not to close the page.
+   The native submit still proceeds (we don't preventDefault) — we
+   only add visual feedback and block re-submission.
+
+   Scope: any <form enctype="multipart/form-data">. That's exactly
+   the set of forms that upload files, which is where the delay is.
+   ============================================================ */
+(function () {
+    'use strict';
+
+    // Guard against double-binding if the script loads twice.
+    if (window.__cmmsUploadGuardBound) return;
+    window.__cmmsUploadGuardBound = true;
+
+    // Build the overlay once, lazily, on first submit.
+    var overlay = null;
+
+    function buildOverlay() {
+        if (overlay) return overlay;
+        overlay = document.createElement('div');
+        overlay.setAttribute('dir', 'rtl');
+        overlay.style.cssText = [
+            'position:fixed', 'inset:0', 'z-index:99999',
+            'background:rgba(15,23,42,0.75)',
+            'display:flex', 'align-items:center', 'justify-content:center',
+            'padding:24px'
+        ].join(';');
+
+        var card = document.createElement('div');
+        card.style.cssText = [
+            'background:#fff', 'border-radius:14px', 'padding:28px 32px',
+            'max-width:340px', 'width:100%', 'text-align:center',
+            'box-shadow:0 20px 50px rgba(0,0,0,0.3)'
+        ].join(';');
+
+        // Spinner (pure CSS, no image dependency).
+        var spinner = document.createElement('div');
+        spinner.style.cssText = [
+            'width:46px', 'height:46px', 'margin:0 auto 18px',
+            'border:4px solid #e2e8f0', 'border-top-color:#ea580c',
+            'border-radius:50%',
+            'animation:cmmsSpin 0.8s linear infinite'
+        ].join(';');
+
+        var title = document.createElement('div');
+        title.style.cssText = 'font-size:17px;font-weight:700;color:#0f172a;margin-bottom:8px;';
+        title.textContent = 'שומר...';
+
+        var msg = document.createElement('div');
+        msg.style.cssText = 'font-size:13px;color:#64748b;line-height:1.6;';
+        msg.textContent = 'מעלה את הנתונים והקבצים. אנא אל תסגור את הדף ואל תלחץ שוב — זה עלול לקחת כמה שניות.';
+
+        card.appendChild(spinner);
+        card.appendChild(title);
+        card.appendChild(msg);
+        overlay.appendChild(card);
+
+        // Inject the keyframes once.
+        if (!document.getElementById('cmms-spin-style')) {
+            var style = document.createElement('style');
+            style.id = 'cmms-spin-style';
+            style.textContent = '@keyframes cmmsSpin{to{transform:rotate(360deg)}}';
+            document.head.appendChild(style);
+        }
+
+        return overlay;
+    }
+
+    document.addEventListener('submit', function (e) {
+        var form = e.target;
+        if (!form || form.tagName !== 'FORM') return;
+
+        // Only guard multipart (file-upload) forms.
+        var enctype = (form.getAttribute('enctype') || '').toLowerCase();
+        if (enctype.indexOf('multipart/form-data') === -1) return;
+
+        // If this form was already submitted (guard flag set), block it.
+        // This is the double-submit protection.
+        if (form.__cmmsSubmitting) {
+            e.preventDefault();
+            return;
+        }
+        form.__cmmsSubmitting = true;
+
+        // Disable submit buttons and show a spinner label so the
+        // button itself communicates progress even before the overlay.
+        var submitBtns = form.querySelectorAll('button[type="submit"], input[type="submit"]');
+        submitBtns.forEach(function (btn) {
+            btn.disabled = true;
+            if (btn.tagName === 'BUTTON') {
+                btn.setAttribute('data-cmms-original-html', btn.innerHTML);
+                btn.innerHTML = '<span style="display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,0.4);border-top-color:#fff;border-radius:50%;animation:cmmsSpin 0.8s linear infinite;vertical-align:middle;margin-left:6px;"></span> שומר...';
+            } else {
+                btn.value = 'שומר...';
+            }
+        });
+
+        // Show the full-screen overlay.
+        var ov = buildOverlay();
+        if (!ov.parentNode) {
+            document.body.appendChild(ov);
+        }
+        ov.style.display = 'flex';
+
+        // Safety net: if the navigation somehow doesn't happen within
+        // 60s (network error mid-upload, server 500, etc), re-enable
+        // the form so the user isn't stuck on a frozen overlay forever.
+        setTimeout(function () {
+            form.__cmmsSubmitting = false;
+            if (ov.parentNode) ov.style.display = 'none';
+            submitBtns.forEach(function (btn) {
+                btn.disabled = false;
+                if (btn.tagName === 'BUTTON') {
+                    var orig = btn.getAttribute('data-cmms-original-html');
+                    if (orig !== null) btn.innerHTML = orig;
+                }
+            });
+        }, 60000);
+
+        // We do NOT preventDefault — the native submit proceeds normally.
+    }, true); // capture phase, so we run before any other handler
 })();
