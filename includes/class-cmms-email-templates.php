@@ -54,6 +54,15 @@ class CMMS_EmailTemplates {
                 'label'       => 'איפוס סיסמה',
                 'description' => 'נשלח כאשר משתמש מבקש איפוס סיסמה דרך "שכחתי סיסמה".',
             ),
+            // 1.14.75 — Phase 5 self-service seat purchase emails.
+            'seats_purchased' => array(
+                'label'       => 'אישור רכישת משתמשים',
+                'description' => 'נשלח ללקוח אחרי שהוא רכש משתמשים נוספים מהדאשבורד.',
+            ),
+            'admin_seats_alert' => array(
+                'label'       => 'התראה למנהל — רכישת משתמשים',
+                'description' => 'נשלח לכתובת האימייל של מנהל האתר כאשר לקוח רוכש משתמשים נוספים. כולל פרטים על העדכון הידני הנדרש ב-iCredit.',
+            ),
         );
     }
 
@@ -70,6 +79,13 @@ class CMMS_EmailTemplates {
             'SITE_URL'          => 'כתובת האתר הראשית',
             'USER_EMAIL'        => 'אימייל הלקוח',
             'RESET_URL'         => 'קישור לאיפוס סיסמה (במייל איפוס בלבד)',
+            // 1.14.75 — additional vars for seat-related emails.
+            'SEATS_ADDED'       => 'כמות המשתמשים שנוספו (במיילי רכישת משתמשים)',
+            'AMOUNT_PAID'       => 'הסכום ששולם (במיילי רכישת משתמשים)',
+            'NEW_TOTAL_USERS'   => 'כמות המשתמשים החדשה הכוללת (במייל אישור ללקוח)',
+            'NEW_RECURRING'     => 'סכום החיוב המחזורי החדש (במייל התראה למנהל)',
+            'RECURRING_ID'      => 'מזהה ה-Recurring ב-iCredit (במייל התראה למנהל)',
+            'ADMIN_PANEL_URL'   => 'קישור לפאנל הניהול (במייל התראה למנהל)',
         );
     }
 
@@ -277,6 +293,62 @@ class CMMS_EmailTemplates {
                     . '<p style="margin:0 0 14px;font-size:13px;color:#64748b;">הקישור תקף ל-24 שעות. לאחר מכן יהיה צורך לבקש איפוס מחדש.</p>'
                     . '<p style="margin:0 0 14px;font-size:13px;color:#64748b;">אם לא ביקשת איפוס סיסמה — אפשר להתעלם מהמייל הזה והסיסמה הנוכחית תישאר ללא שינוי.</p>'
                     . '<p style="margin:0 0 8px;font-size:13px;color:#64748b;">לעזרה: {{SUPPORT_EMAIL}}</p>',
+            ),
+
+            // 1.14.75 — Customer confirmation after self-service seat purchase.
+            'seats_purchased' => array(
+                'subject'   => 'אישור רכישת משתמשים נוספים - CMMS',
+                'body_html' =>
+                    '<h2 style="color:#0f172a;margin:0 0 14px;font-size:22px;">{{FULL_NAME}}, הוספת המשתמשים הצליחה 🎉</h2>'
+                    . '<p style="margin:0 0 14px;">תודה על הרכישה. {{SEATS_ADDED}} משתמשים נוספים נפתחו בחשבונך ב-CMMS ופעילים מעכשיו.</p>'
+                    . '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:16px 20px;margin:0 0 22px;">'
+                    . '<table style="width:100%;border-collapse:collapse;font-size:14px;">'
+                    . '<tr><td style="padding:6px 0;color:#64748b;">חבילה</td><td style="padding:6px 0;text-align:end;font-weight:600;">{{PACKAGE_NAME}} / {{BILLING_CYCLE}}</td></tr>'
+                    . '<tr><td style="padding:6px 0;color:#64748b;">משתמשים נוספים</td><td style="padding:6px 0;text-align:end;font-weight:600;">{{SEATS_ADDED}}</td></tr>'
+                    . '<tr><td style="padding:6px 0;color:#64748b;">סה"כ משתמשים מותרים</td><td style="padding:6px 0;text-align:end;font-weight:600;">{{NEW_TOTAL_USERS}}</td></tr>'
+                    . '<tr><td style="padding:6px 0;color:#64748b;">חיוב יחסי ששולם</td><td style="padding:6px 0;text-align:end;font-weight:700;color:#4f46e5;">{{AMOUNT_PAID}}</td></tr>'
+                    . '</table>'
+                    . '</div>'
+                    . '<p style="margin:0 0 14px;font-size:13px;color:#64748b;">החיוב המחזורי החודש הבא יעודכן בהתאם לסכום החדש. אישור החיוב נשלח גם דרך iCredit.</p>'
+                    . '<p style="margin:0 0 22px;"><a href="{{DASHBOARD_URL}}" style="display:inline-block;padding:13px 28px;background:linear-gradient(135deg,#4f46e5 0%,#7c3aed 100%);color:#ffffff;text-decoration:none;border-radius:10px;font-weight:600;">חזרה לדאשבורד</a></p>'
+                    . '<p style="margin:0 0 8px;font-size:13px;color:#64748b;">לכל שאלה ניתן לפנות אלינו ב-{{SUPPORT_EMAIL}}</p>',
+            ),
+
+            // 1.14.75 — Admin alert when a customer self-purchases seats.
+            // Sent to wp_options.admin_email so the admin knows to update
+            // the iCredit recurring manually.
+            'admin_seats_alert' => array(
+                'subject'   => '⚠️ עדכון נדרש ב-iCredit — לקוח רכש משתמשים נוספים',
+                'body_html' =>
+                    '<h2 style="color:#0f172a;margin:0 0 14px;font-size:22px;">לקוח רכש משתמשים נוספים</h2>'
+                    . '<p style="margin:0 0 14px;font-size:14px;">לקוח השלים רכישת משתמשים נוספים דרך הדאשבורד. נדרש עדכון ידני של ה-Recurring ב-iCredit.</p>'
+                    . '<div style="background:#fffbeb;border:1.5px solid #fcd34d;border-radius:10px;padding:16px 20px;margin:0 0 18px;">'
+                    . '<h3 style="margin:0 0 10px;font-size:15px;color:#78350f;">פרטי הלקוח</h3>'
+                    . '<table style="width:100%;border-collapse:collapse;font-size:13.5px;">'
+                    . '<tr><td style="padding:5px 0;color:#78350f;">חברה</td><td style="padding:5px 0;text-align:end;font-weight:600;">{{COMPANY_NAME}}</td></tr>'
+                    . '<tr><td style="padding:5px 0;color:#78350f;">שם הלקוח</td><td style="padding:5px 0;text-align:end;">{{FULL_NAME}}</td></tr>'
+                    . '<tr><td style="padding:5px 0;color:#78350f;">אימייל</td><td style="padding:5px 0;text-align:end;">{{USER_EMAIL}}</td></tr>'
+                    . '<tr><td style="padding:5px 0;color:#78350f;">חבילה</td><td style="padding:5px 0;text-align:end;">{{PACKAGE_NAME}} / {{BILLING_CYCLE}}</td></tr>'
+                    . '</table>'
+                    . '</div>'
+                    . '<div style="background:#eef2ff;border:1.5px solid #c7d2fe;border-radius:10px;padding:16px 20px;margin:0 0 18px;">'
+                    . '<h3 style="margin:0 0 10px;font-size:15px;color:#3730a3;">פרטי הרכישה</h3>'
+                    . '<table style="width:100%;border-collapse:collapse;font-size:13.5px;">'
+                    . '<tr><td style="padding:5px 0;color:#3730a3;">משתמשים שנוספו</td><td style="padding:5px 0;text-align:end;font-weight:700;">+{{SEATS_ADDED}}</td></tr>'
+                    . '<tr><td style="padding:5px 0;color:#3730a3;">חיוב יחסי שנגבה</td><td style="padding:5px 0;text-align:end;font-weight:600;">{{AMOUNT_PAID}}</td></tr>'
+                    . '<tr><td style="padding:5px 0;color:#3730a3;">Recurring חדש (חודשי)</td><td style="padding:5px 0;text-align:end;font-weight:700;color:#4f46e5;">{{NEW_RECURRING}}</td></tr>'
+                    . '<tr><td style="padding:5px 0;color:#3730a3;">iCredit RecurringId</td><td style="padding:5px 0;text-align:end;font-family:monospace;font-size:12px;">{{RECURRING_ID}}</td></tr>'
+                    . '</table>'
+                    . '</div>'
+                    . '<h3 style="margin:0 0 10px;font-size:15px;color:#0f172a;">פעולות נדרשות</h3>'
+                    . '<ol style="margin:0 0 18px;padding-inline-start:22px;font-size:14px;line-height:1.7;">'
+                    . '<li>היכנס ל-iCredit עם ה-RecurringId שמופיע למעלה.</li>'
+                    . '<li>עדכן את הסכום החודשי ל-{{NEW_RECURRING}}.</li>'
+                    . '<li>שמור.</li>'
+                    . '<li>חזור לפאנל הניהול ולחץ "Mark as updated" כדי לסמן שהעדכון בוצע.</li>'
+                    . '</ol>'
+                    . '<p style="margin:0 0 22px;"><a href="{{ADMIN_PANEL_URL}}" style="display:inline-block;padding:13px 28px;background:linear-gradient(135deg,#4f46e5 0%,#7c3aed 100%);color:#ffffff;text-decoration:none;border-radius:10px;font-weight:600;">פתח את פאנל הניהול</a></p>'
+                    . '<p style="margin:0;font-size:12px;color:#94a3b8;">החיוב היחסי החד-פעמי כבר נגבה. הלקוח קיבל את המשתמשים שלו. נשאר רק לעדכן את ה-recurring העתידי ב-iCredit.</p>',
             ),
         );
     }

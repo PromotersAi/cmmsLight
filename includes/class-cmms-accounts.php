@@ -7,7 +7,7 @@ class CMMS_Accounts {
         global $wpdb;
         $table = CMMS_DB::table( 'accounts' );
         $wpdb->insert( $table, array(
-            'name'          => sanitize_text_field( $name ),
+            'name'          => sanitize_text_field( $name ), 
             'owner_user_id' => intval( $owner_user_id ),
             'status'        => 'active',
             'created_at'    => current_time( 'mysql' ),

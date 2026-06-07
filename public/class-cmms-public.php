@@ -9,7 +9,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 class CMMS_Public {
 
     public function register() {
-        add_action( 'wp_enqueue_scripts', array( $this, 'enqueue' ) );
+        add_action( 'wp_enqueue_scripts', array( $this, 'enqueue' ) ); 
         // Run AFTER all themes/plugins enqueue (priority 999) so we can
         // remove their assets cleanly on CMMS pages only.
         add_action( 'wp_enqueue_scripts', array( $this, 'dequeue_third_party_on_cmms_pages' ), 999 );

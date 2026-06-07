@@ -64,6 +64,30 @@ class CMMS_Categories {
         return $wpdb->update( $table, array( 'enabled' => $enabled ? 1 : 0 ), array( 'id' => $id ), array( '%d' ), array( '%d' ) );
     }
 
+    /**
+     * 1.14.82 — Rename a category. Allowed for both default and custom
+     * categories: the customer can localize "Preventive Maintenance" to
+     * "תחזוקה מונעת" or whatever fits their terminology. The slug stays
+     * (used for internal mapping in CMMS_Demo and elsewhere), only the
+     * displayed name changes.
+     *
+     * Returns true on success, false on empty input, WP_Error on DB error.
+     */
+    public static function update_name( $id, $name ) {
+        global $wpdb;
+        $table = CMMS_DB::table( 'categories' );
+        $name = sanitize_text_field( $name );
+        if ( empty( $name ) ) return false;
+        $result = $wpdb->update(
+            $table,
+            array( 'name' => $name ),
+            array( 'id' => (int) $id ),
+            array( '%s' ),
+            array( '%d' )
+        );
+        return $result !== false;
+    }
+
     public static function delete( $id ) {
         global $wpdb;
         $cat = self::get( $id );

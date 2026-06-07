@@ -5,7 +5,7 @@
  * Fired when the plugin is deleted from WordPress admin.
  *
  * SAFE BY DEFAULT: We do NOT drop tables or delete pages on uninstall unless
- * the site administrator has explicitly opted in by setting the option
+ * the site administrator has explicitly opted in by setting the option 
  * `cmms_light_drop_data_on_uninstall` to a truthy value. This is to prevent
  * accidental, irreversible data loss when the plugin is upgraded by deleting
  * and re-uploading the ZIP (which is what less experienced users sometimes do).

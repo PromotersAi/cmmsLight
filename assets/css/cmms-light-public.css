@@ -6,7 +6,7 @@
 
 :root {
     /* Industrial palette - deep navy authority + safety orange action */
-    --c-navy-900: #0b1c33;
+    --c-navy-900: #0b1c33; 
     --c-navy-800: #0f2440;
     --c-navy-700: #14304f;
     --c-navy-600: #1a3a60;
@@ -2049,6 +2049,47 @@ button.cmms-btn-danger {
     font-size: 13px;
     line-height: 1.5;
     margin: 0;
+}
+/* 1.14.90: form picker — sits inside the toolbar under the paste hint */
+.cmms-bulk-form-picker {
+    margin-top: 10px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    background: #f1f5f9;
+    border: 1px solid #cbd5e1;
+    padding: 10px 12px;
+    border-radius: 8px;
+}
+.cmms-bulk-form-picker-label {
+    font-weight: 600;
+    font-size: 13px;
+    color: #0f172a;
+    margin: 0;
+}
+.cmms-bulk-form-select {
+    min-width: 220px;
+    padding: 6px 10px;
+    border: 1px solid #94a3b8;
+    border-radius: 6px;
+    background: #fff;
+    font-size: 13px;
+}
+.cmms-bulk-form-hint {
+    font-size: 12px;
+    color: #475569;
+    flex-basis: 100%;
+}
+.cmms-bulk-th-form-field {
+    background: #eef2ff;
+    color: #312e81;
+}
+.cmms-bulk-input-disabled {
+    background: #f1f5f9 !important;
+    color: #94a3b8 !important;
+    cursor: not-allowed;
+    font-style: italic;
 }
 .cmms-bulk-grid-wrap {
     overflow-x: auto;

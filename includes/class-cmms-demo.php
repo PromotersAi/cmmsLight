@@ -187,6 +187,30 @@ class CMMS_Demo {
             CMMS_Forms::add_field( $form_id, array( 'label' => 'Photo (optional)',      'field_type' => 'file',     'required' => 0, 'sort_order' => 5 ) );
         }
 
+        // 1.14.81.3: Mark the account as a demo account so the payment
+        // gate lets users sign in. Without this, demo accounts (which
+        // have no subscription record) were redirected to the "complete
+        // payment" screen — making them inaccessible to prospects we
+        // shared them with.
+        //
+        // 'demo' is treated as a first-class subscription status:
+        //   - The dashboard gate allows access (like 'active')
+        //   - It's distinct from 'trial' so we never accidentally
+        //     prompt for payment on a demo account
+        //   - Anyone with admin access can convert it to a real
+        //     subscription later by changing this column
+        global $wpdb;
+        $acc_t = CMMS_DB::table( 'accounts' );
+        if ( $acc_t ) {
+            $wpdb->update(
+                $acc_t,
+                array( 'subscription_status' => 'demo' ),
+                array( 'id' => (int) $account_id ),
+                array( '%s' ),
+                array( '%d' )
+            );
+        }
+
         return array(
             'account_id'    => $account_id,
             'organization'  => 'Demo Organization' . self::$suffix,

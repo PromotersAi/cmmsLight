@@ -11,7 +11,7 @@ if ( ! defined( 'ABSPATH' ) ) exit;
  *   2. EDIT     — subject input, custom rich-text body editor,
  *                 variable chips, preview pane, send-test button,
  *                 reset-to-default button.
- *
+ * 
  * The editor is a custom contenteditable-based component:
  *   - No external libraries (no TinyMCE, no CKEditor)
  *   - Toolbar: bold, italic, underline, link, H2, paragraph, color,

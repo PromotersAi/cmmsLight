@@ -57,6 +57,22 @@ class CMMS_Plugin {
         // Make sure the recurring sweep is scheduled.
         CMMS_Cron::ensure_scheduled();
 
+        // 1.14.84: Telegram webhook (REST API endpoint).
+        // Self-registers via add_action('rest_api_init', ...) so it's
+        // safe to call even when Telegram is disabled — the route
+        // exists but rejects every request without a valid secret.
+        CMMS_Telegram_Webhook::init();
+
+        // 1.14.94: Webhook API for external task creation. Same pattern
+        // as Telegram_Webhook — registers a REST route that does its own
+        // auth (Bearer token in Authorization header).
+        add_action( 'rest_api_init', array( 'CMMS_Webhook', 'register_routes' ) );
+
+        // 1.14.98: Email-to-task. Receives forwarded emails as JSON
+        // (delivered via CloudFlare Email Worker) and creates tasks.
+        // Auth is HMAC signature in 'X-CMMS-Signature' header.
+        add_action( 'rest_api_init', array( 'CMMS_Email_Inbox', 'register_routes' ) );
+
         // Global admin (only inside wp-admin).
         if ( is_admin() ) {
             $admin = new CMMS_Admin();

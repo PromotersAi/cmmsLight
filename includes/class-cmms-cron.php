@@ -51,6 +51,23 @@ class CMMS_Cron {
         return $schedules;
     }
 
+    /**
+     * 1.15.5: Prune the email inbound log to 30 days. Runs at most
+     * once per day — we gate it with a transient so the 5-minute
+     * dispatch loop doesn't run a DELETE every 5 minutes. Piggybacking
+     * on the existing cron avoids registering a separate daily event.
+     */
+    private function maybe_prune_email_log() {
+        if ( get_transient( 'cmms_email_log_pruned_today' ) ) {
+            return;
+        }
+        if ( class_exists( 'CMMS_Email_Inbox' ) ) {
+            CMMS_Email_Inbox::prune_inbound_log();
+        }
+        // Gate for 24h.
+        set_transient( 'cmms_email_log_pruned_today', 1, DAY_IN_SECONDS );
+    }
+
     public static function ensure_scheduled() {
         if ( ! wp_next_scheduled( self::HOOK_DISPATCH ) ) {
             wp_schedule_event( time() + 60, 'cmms_5min', self::HOOK_DISPATCH );
@@ -68,6 +85,9 @@ class CMMS_Cron {
      */
     public function dispatch_due_reminders() {
         global $wpdb;
+
+        // 1.15.5: Prune the email inbound log (once/day, gated).
+        $this->maybe_prune_email_log();
 
         // 1.14.40: piggyback on the 5-min cron tick to process
         // subscription grace expirations. We throttle to once per day

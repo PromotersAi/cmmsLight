@@ -215,10 +215,45 @@ class CMMS_Tasks {
             if ( $entering_final ) {
                 $update['completed_at'] = current_time( 'mysql' );
                 $format[] = '%s';
+
+                // 1.14.87: Capture completion location if the caller
+                // provided GPS data. We accept lat/lng/address/source
+                // ONLY when transitioning into a final state — never
+                // mid-flight, never on other status changes. The
+                // browser/Telegram client is the one collecting these
+                // and passing them in.
+                if ( isset( $data['completion_lat'] ) && isset( $data['completion_lng'] ) ) {
+                    $lat = (float) $data['completion_lat'];
+                    $lng = (float) $data['completion_lng'];
+                    // Sanity-check the coordinates. GPS-ish range.
+                    if ( $lat >= -90 && $lat <= 90 && $lng >= -180 && $lng <= 180 ) {
+                        $update['completion_lat'] = $lat;
+                        $update['completion_lng'] = $lng;
+                        $format[] = '%f';
+                        $format[] = '%f';
+                        if ( ! empty( $data['completion_address'] ) ) {
+                            $update['completion_address'] = mb_substr( sanitize_text_field( (string) $data['completion_address'] ), 0, 500 );
+                            $format[] = '%s';
+                        }
+                        $src = isset( $data['completion_location_source'] ) ? sanitize_text_field( (string) $data['completion_location_source'] ) : 'browser';
+                        // Whitelist sources to avoid garbage in reports.
+                        if ( ! in_array( $src, array( 'browser', 'telegram', 'manual' ), true ) ) {
+                            $src = 'browser';
+                        }
+                        $update['completion_location_source'] = $src;
+                        $format[] = '%s';
+                    }
+                }
             } elseif ( $leaving_final ) {
                 // Reopened — clear completed_at so reports don't double-count.
                 $update['completed_at'] = null;
                 $format[] = '%s';
+                // 1.14.87: Also clear location — old location is stale.
+                $update['completion_lat'] = null;
+                $update['completion_lng'] = null;
+                $update['completion_address'] = null;
+                $update['completion_location_source'] = null;
+                $format[] = '%s'; $format[] = '%s'; $format[] = '%s'; $format[] = '%s';
             }
         }
 
@@ -248,6 +283,87 @@ class CMMS_Tasks {
         return $wpdb->get_row( $wpdb->prepare( "SELECT * FROM $table WHERE id = %d", $id ) );
     }
 
+    /**
+     * 1.14.83: Soft-delete a task. Sets deleted_at to NOW() so the
+     * task disappears from normal lists but remains in the DB. This
+     * keeps:
+     *   - Reports historically accurate (admin can include archived)
+     *   - Audit log intact (task_logs not touched)
+     *   - Attachments accessible if a recovery is needed
+     *
+     * Returns true on success, false if the task doesn't exist.
+     */
+    public static function soft_delete( $id, $by_user_id = 0 ) {
+        global $wpdb;
+        $task = self::get( $id );
+        if ( ! $task ) return false;
+        // Already soft-deleted? Idempotent — no-op.
+        if ( ! empty( $task->deleted_at ) ) return true;
+        $wpdb->update(
+            CMMS_DB::table( 'tasks' ),
+            array(
+                'deleted_at' => current_time( 'mysql' ),
+                'updated_at' => current_time( 'mysql' ),
+            ),
+            array( 'id' => (int) $id ),
+            array( '%s', '%s' ),
+            array( '%d' )
+        );
+        // Log the deletion to task_logs so we have a who/when/what
+        // record even after the task is hidden from the UI.
+        $logs_t = CMMS_DB::table( 'task_logs' );
+        if ( $logs_t ) {
+            $wpdb->insert( $logs_t, array(
+                'task_id'    => (int) $id,
+                'account_id' => (int) $task->account_id,
+                'user_id'    => (int) $by_user_id,
+                'action'     => 'deleted',
+                'detail'     => 'Task soft-deleted',
+                'created_at' => current_time( 'mysql' ),
+            ), array( '%d', '%d', '%d', '%s', '%s', '%s' ) );
+        }
+        return true;
+    }
+
+    /**
+     * 1.14.83: Restore a soft-deleted task. Clears deleted_at. Used
+     * by the (future) archive page; not exposed in this version's UI
+     * but the backend method exists so the archive can be added later
+     * with zero changes here.
+     */
+    public static function restore( $id, $by_user_id = 0 ) {
+        global $wpdb;
+        $task = self::get( $id );
+        if ( ! $task ) return false;
+        $wpdb->update(
+            CMMS_DB::table( 'tasks' ),
+            array(
+                'deleted_at' => null,
+                'updated_at' => current_time( 'mysql' ),
+            ),
+            array( 'id' => (int) $id ),
+            array( '%s', '%s' ),
+            array( '%d' )
+        );
+        $logs_t = CMMS_DB::table( 'task_logs' );
+        if ( $logs_t ) {
+            $wpdb->insert( $logs_t, array(
+                'task_id'    => (int) $id,
+                'account_id' => (int) $task->account_id,
+                'user_id'    => (int) $by_user_id,
+                'action'     => 'restored',
+                'detail'     => 'Task restored from soft-delete',
+                'created_at' => current_time( 'mysql' ),
+            ), array( '%d', '%d', '%d', '%s', '%s', '%s' ) );
+        }
+        return true;
+    }
+
+    /**
+     * Legacy hard-delete. Kept ONLY for account-wide cleanup (when an
+     * account is deleted entirely from CMMS_Accounts). Not for normal
+     * user-initiated deletion — those go through soft_delete().
+     */
     public static function delete( $id ) {
         global $wpdb;
         $task = self::get( $id );
@@ -267,6 +383,11 @@ class CMMS_Tasks {
         $where[] = "account_id = %d";
         $args[] = $cmms_user->account_id;
 
+        // 1.14.83: Exclude soft-deleted tasks from normal lists. The
+        // archive (when built) will use a separate query path that
+        // intentionally INCLUDES deleted_at IS NOT NULL.
+        $where[] = "deleted_at IS NULL";
+
         // Visibility scoping (1.14.19): same rules as can_view_task.
         //   Owners/managers — see everything in the account.
         //   Everyone else — assignee OR manager OR creator (the related set).
@@ -284,6 +405,46 @@ class CMMS_Tasks {
             $args[] = $cmms_user->id;
             $args[] = $cmms_user->id;
             $args[] = $cmms_user->id;
+        }
+
+        // 1.14.79: 'mine' filter — UX-level scoping that lets even
+        // privileged users (owner/manager) narrow the list to tasks
+        // they are personally involved in (assignee / manager / creator).
+        //
+        // This is a server-side filter applied at the SQL level — NOT
+        // a CSS hide. With hundreds of tasks per account this is the
+        // only way to keep the page fast: the DB returns only the rows
+        // the user actually wants, the renderer only iterates those.
+        //
+        // For non-privileged users the visibility scope above already
+        // restricts to their related set, so applying 'mine' on top is
+        // a no-op for them. We still allow it (harmless redundancy) so
+        // the caller can pass the same filter regardless of role.
+        if ( ! empty( $filters['mine'] ) ) {
+            $where[] = "( assigned_to = %d OR manager_id = %d OR created_by = %d )";
+            $args[] = $cmms_user->id;
+            $args[] = $cmms_user->id;
+            $args[] = $cmms_user->id;
+        }
+
+        // 1.15.2: Filter by selected user IDs (multi-select dropdown
+        // in the tasks page). Shows tasks where ANY of the selected
+        // users is the assignee, manager, or creator — same scope as
+        // the 'mine' filter, just for a chosen set of users instead
+        // of the current user. Only privileged roles (owner/manager)
+        // can use this filter because the UI hides it from others;
+        // we still defend in depth at the SQL layer.
+        if ( ! empty( $filters['users'] ) && is_array( $filters['users'] ) ) {
+            $clean_ids = array_filter( array_map( 'intval', $filters['users'] ) );
+            if ( ! empty( $clean_ids ) ) {
+                $placeholders = implode( ',', array_fill( 0, count( $clean_ids ), '%d' ) );
+                // Each user matches if they're assignee OR manager OR creator.
+                // We need the same set of IDs three times (once per column).
+                $where[] = "( assigned_to IN ($placeholders) "
+                         . "OR manager_id IN ($placeholders) "
+                         . "OR created_by IN ($placeholders) )";
+                $args = array_merge( $args, $clean_ids, $clean_ids, $clean_ids );
+            }
         }
 
         if ( ! empty( $filters['status'] ) ) {
@@ -342,10 +503,35 @@ class CMMS_Tasks {
             }
         }
 
+        // 1.14.81: Filter for tasks WITHOUT a due_date — used by the
+        // calendar's "X tasks without due date" banner so we can link
+        // users to the list view to fix those tasks. Mutually exclusive
+        // with date_from/date_to using due_date (those queries by
+        // definition exclude NULL due_date rows).
+        if ( ! empty( $filters['no_due_date'] ) ) {
+            $where[] = "( due_date IS NULL OR due_date = '' OR due_date = '0000-00-00 00:00:00' )";
+        }
+
+        // 1.14.79: hard LIMIT to keep page render fast even with
+        // thousands of tasks. Default 500 rows per query covers all
+        // reasonable usage (a manager browsing their inbox); pagination
+        // is the proper next step once accounts grow past this.
+        //
+        // Callers can override via $filters['limit'] (0 = unlimited,
+        // used by background reports and counts).
+        $limit = isset( $filters['limit'] ) ? (int) $filters['limit'] : 500;
+        $limit_sql = '';
+        if ( $limit > 0 ) {
+            $limit_sql = ' LIMIT ' . $limit;
+            if ( ! empty( $filters['offset'] ) ) {
+                $limit_sql .= ' OFFSET ' . (int) $filters['offset'];
+            }
+        }
+
         $sql = "SELECT * FROM $table WHERE " . implode( ' AND ', $where ) . " ORDER BY 
             FIELD(status, 'open','in_progress','waiting','completed','closed'),
             FIELD(priority, 'urgent','high','normal','low'),
-            (due_date IS NULL), due_date ASC, id DESC";
+            (due_date IS NULL), due_date ASC, id DESC" . $limit_sql;
         return $wpdb->get_results( $wpdb->prepare( $sql, $args ) );
     }
 
@@ -397,10 +583,91 @@ class CMMS_Tasks {
             }
         }
 
-        $open      = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $table WHERE account_id = %d AND status IN ('open','in_progress','waiting')$extra", array_merge( array( $account_id ), $extra_args ) ) );
-        $completed = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $table WHERE account_id = %d AND status IN ('completed','closed')$extra", array_merge( array( $account_id ), $extra_args ) ) );
-        $overdue   = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $table WHERE account_id = %d AND status NOT IN ('completed','closed') AND due_date IS NOT NULL AND due_date < %s$extra", array_merge( array( $account_id, $now ), $extra_args ) ) );
-        $total     = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $table WHERE account_id = %d$extra", array_merge( array( $account_id ), $extra_args ) ) );
+        // 1.14.83: Counters always exclude soft-deleted tasks.
+        $del_clause = " AND deleted_at IS NULL";
+
+        $open      = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $table WHERE account_id = %d AND status IN ('open','in_progress','waiting')$del_clause$extra", array_merge( array( $account_id ), $extra_args ) ) );
+        $completed = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $table WHERE account_id = %d AND status IN ('completed','closed')$del_clause$extra", array_merge( array( $account_id ), $extra_args ) ) );
+        $overdue   = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $table WHERE account_id = %d AND status NOT IN ('completed','closed') AND due_date IS NOT NULL AND due_date < %s$del_clause$extra", array_merge( array( $account_id, $now ), $extra_args ) ) );
+        $total     = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $table WHERE account_id = %d$del_clause$extra", array_merge( array( $account_id ), $extra_args ) ) );
         return compact( 'open', 'completed', 'overdue', 'total' );
+    }
+
+    /* ================================================================
+       TIME / DURATION HELPERS (1.14.87)
+    ================================================================ */
+
+    /**
+     * Format a duration in seconds to a Hebrew-friendly string.
+     * Examples:
+     *   30      → "30 שניות"
+     *   90      → "דקה ו-30 שניות"
+     *   3600    → "שעה"
+     *   3900    → "1ש 5ד"
+     *   86400   → "1 י 0ש"
+     *   90000   → "1 י 1ש"
+     *
+     * Used in the task detail page to show "execution time" and
+     * "total time". Short labels because mobile screens are narrow.
+     */
+    public static function format_duration( $seconds ) {
+        $seconds = (int) $seconds;
+        if ( $seconds < 0 ) return '';
+        if ( $seconds < 60 ) return $seconds . ' שניות';
+
+        $minutes = (int) floor( $seconds / 60 );
+        if ( $minutes < 60 ) {
+            return $minutes . ' דק׳';
+        }
+
+        $hours = (int) floor( $minutes / 60 );
+        $rem_minutes = $minutes - ( $hours * 60 );
+        if ( $hours < 24 ) {
+            if ( $rem_minutes === 0 ) return $hours . ' ש׳';
+            return $hours . 'ש ' . $rem_minutes . 'ד';
+        }
+
+        $days = (int) floor( $hours / 24 );
+        $rem_hours = $hours - ( $days * 24 );
+        if ( $rem_hours === 0 ) return $days . ' י׳';
+        return $days . 'י ' . $rem_hours . 'ש';
+    }
+
+    /**
+     * Compute task durations given its timestamps.
+     * Returns array with:
+     *   response_seconds  — created_at → started_at (waiting before work)
+     *   execution_seconds — started_at → completed_at (actual work time)
+     *   total_seconds     — created_at → completed_at
+     * Any of these may be null if the relevant timestamps are missing.
+     */
+    public static function calculate_durations( $task ) {
+        $result = array(
+            'response_seconds'  => null,
+            'execution_seconds' => null,
+            'total_seconds'     => null,
+        );
+        if ( empty( $task->created_at ) ) return $result;
+        $created_ts = strtotime( $task->created_at );
+
+        if ( ! empty( $task->started_at ) ) {
+            $started_ts = strtotime( $task->started_at );
+            if ( $started_ts >= $created_ts ) {
+                $result['response_seconds'] = $started_ts - $created_ts;
+            }
+        }
+        if ( ! empty( $task->completed_at ) ) {
+            $completed_ts = strtotime( $task->completed_at );
+            if ( $completed_ts >= $created_ts ) {
+                $result['total_seconds'] = $completed_ts - $created_ts;
+            }
+            if ( ! empty( $task->started_at ) ) {
+                $started_ts = strtotime( $task->started_at );
+                if ( $completed_ts >= $started_ts ) {
+                    $result['execution_seconds'] = $completed_ts - $started_ts;
+                }
+            }
+        }
+        return $result;
     }
 }

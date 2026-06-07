@@ -75,6 +75,35 @@ class CMMS_Plans {
             $row['id']               = (int) $row['id'];
             $row['price']            = (float) $row['price'];
             $row['max_users']        = ( $row['max_users'] === null || $row['max_users'] === '' ) ? null : (int) $row['max_users'];
+
+            // 1.14.71: seat fields. Stored as NULL for Enterprise/custom
+            // packages, integers/decimals for Starter/Business. Cast
+            // explicitly so downstream code can rely on the types.
+            if ( array_key_exists( 'included_seats', $row ) ) {
+                $row['included_seats'] = ( $row['included_seats'] === null || $row['included_seats'] === '' )
+                    ? null : (int) $row['included_seats'];
+            } else {
+                $row['included_seats'] = null;
+            }
+            if ( array_key_exists( 'seat_addon_price', $row ) ) {
+                $row['seat_addon_price'] = ( $row['seat_addon_price'] === null || $row['seat_addon_price'] === '' )
+                    ? null : (float) $row['seat_addon_price'];
+            } else {
+                $row['seat_addon_price'] = null;
+            }
+            if ( array_key_exists( 'hard_user_limit', $row ) ) {
+                $row['hard_user_limit'] = ( $row['hard_user_limit'] === null || $row['hard_user_limit'] === '' )
+                    ? null : (int) $row['hard_user_limit'];
+            } else {
+                $row['hard_user_limit'] = null;
+            }
+            if ( array_key_exists( 'upgrade_recommended_at', $row ) ) {
+                $row['upgrade_recommended_at'] = ( $row['upgrade_recommended_at'] === null || $row['upgrade_recommended_at'] === '' )
+                    ? null : (int) $row['upgrade_recommended_at'];
+            } else {
+                $row['upgrade_recommended_at'] = null;
+            }
+
             $row['is_active']        = (int) $row['is_active'];
             $row['show_on_pricing']  = (int) $row['show_on_pricing'];
             $row['manual_only']      = (int) $row['manual_only'];
@@ -180,6 +209,114 @@ class CMMS_Plans {
     }
 
     /* ============================================================
+       1.14.71 — Seat helpers
+
+       All methods take ($plan_type, $billing_cycle) and read directly
+       from the package row. Returns NULL when the package has no seat
+       configuration (Enterprise / custom packages).
+    ============================================================ */
+
+    /**
+     * How many users are included in the base package price.
+     *
+     * Returns:
+     *   int  — Starter=3, Business=10 by default
+     *   null — Enterprise (custom / unlimited)
+     */
+    public static function included_seats( $plan_type, $billing_cycle = 'monthly' ) {
+        $pkg = self::get_package( $plan_type, $billing_cycle );
+        if ( ! $pkg ) return null;
+        return ( $pkg['included_seats'] !== null && $pkg['included_seats'] !== '' )
+            ? (int) $pkg['included_seats']
+            : null;
+    }
+
+    /**
+     * Price per additional seat for this package & cycle.
+     *
+     * Monthly returns the monthly price (e.g. 50 → ₪50/month per seat).
+     * Yearly  returns the yearly price (i.e. seat_addon_price as stored,
+     *                                    which is configured as the
+     *                                    yearly-equivalent — Super Admin
+     *                                    sets this explicitly per row).
+     *
+     * Returns null if seats aren't supported (Enterprise / custom).
+     */
+    public static function seat_addon_price( $plan_type, $billing_cycle = 'monthly' ) {
+        $pkg = self::get_package( $plan_type, $billing_cycle );
+        if ( ! $pkg ) return null;
+        return ( $pkg['seat_addon_price'] !== null && $pkg['seat_addon_price'] !== '' )
+            ? (float) $pkg['seat_addon_price']
+            : null;
+    }
+
+    /**
+     * Hard ceiling for this package — above this, customer must upgrade.
+     *
+     * Returns:
+     *   int  — Starter=10, Business=25 by default
+     *   null — Enterprise (no ceiling)
+     */
+    public static function hard_user_limit( $plan_type, $billing_cycle = 'monthly' ) {
+        $pkg = self::get_package( $plan_type, $billing_cycle );
+        if ( ! $pkg ) return null;
+        return ( $pkg['hard_user_limit'] !== null && $pkg['hard_user_limit'] !== '' )
+            ? (int) $pkg['hard_user_limit']
+            : null;
+    }
+
+    /**
+     * Percent of hard_user_limit at which to show "upgrade recommended".
+     * E.g. 80 → suggest upgrade once user count reaches 80% of the ceiling.
+     *
+     * Returns null when not configured (Enterprise / disabled).
+     */
+    public static function upgrade_recommended_at( $plan_type, $billing_cycle = 'monthly' ) {
+        $pkg = self::get_package( $plan_type, $billing_cycle );
+        if ( ! $pkg ) return null;
+        return ( $pkg['upgrade_recommended_at'] !== null && $pkg['upgrade_recommended_at'] !== '' )
+            ? (int) $pkg['upgrade_recommended_at']
+            : null;
+    }
+
+    /**
+     * Total price for $total_users on a given plan.
+     *
+     *   total_users <= included_seats   → just the base price
+     *   total_users  > included_seats   → base + (extras × seat price)
+     *
+     * If the package doesn't support seats (Enterprise / custom price),
+     * returns the base price unchanged.
+     */
+    public static function calculate_total_price( $plan_type, $billing_cycle, $total_users ) {
+        $pkg = self::get_package( $plan_type, $billing_cycle );
+        if ( ! $pkg ) return 0.0;
+        $base       = (float) $pkg['price'];
+        $included   = ( $pkg['included_seats'] !== null )   ? (int) $pkg['included_seats']     : null;
+        $seat_price = ( $pkg['seat_addon_price'] !== null ) ? (float) $pkg['seat_addon_price'] : null;
+
+        if ( $included === null || $seat_price === null ) {
+            return $base;
+        }
+
+        $extras = max( 0, (int) $total_users - $included );
+        return $base + ( $extras * $seat_price );
+    }
+
+    /**
+     * Whether $seats_to_add can be added to an account currently using
+     * $current_users on $plan_type. Returns boolean.
+     *
+     * Logic: current + seats_to_add must be ≤ hard_user_limit.
+     * NULL hard_user_limit (Enterprise) means unlimited → always true.
+     */
+    public static function is_seats_addable( $plan_type, $current_users, $seats_to_add, $billing_cycle = 'monthly' ) {
+        $limit = self::hard_user_limit( $plan_type, $billing_cycle );
+        if ( $limit === null ) return true;
+        return ( (int) $current_users + (int) $seats_to_add ) <= (int) $limit;
+    }
+
+    /* ============================================================
        Internals
     ============================================================ */
 
@@ -204,16 +341,19 @@ class CMMS_Plans {
     /**
      * Hardcoded PHP fallback for the rare case where the packages
      * table is missing or empty. Mirrors the seed in the activator.
+     *
+     * 1.14.71: includes seat fields (included_seats, seat_addon_price,
+     * hard_user_limit, upgrade_recommended_at).
      */
     private static function fallback_packages() {
         $now = current_time( 'mysql' );
         $defaults = array(
-            array( 'plan_type' => 'starter',    'billing_cycle' => 'monthly', 'price' => 299,   'max_users' => 3,    'recommended' => 0, 'custom_price' => 0, 'sort_order' => 10 ),
-            array( 'plan_type' => 'starter',    'billing_cycle' => 'yearly',  'price' => 2990,  'max_users' => 3,    'recommended' => 0, 'custom_price' => 0, 'sort_order' => 11 ),
-            array( 'plan_type' => 'business',   'billing_cycle' => 'monthly', 'price' => 690,   'max_users' => 10,   'recommended' => 1, 'custom_price' => 0, 'sort_order' => 20 ),
-            array( 'plan_type' => 'business',   'billing_cycle' => 'yearly',  'price' => 6900,  'max_users' => 10,   'recommended' => 1, 'custom_price' => 0, 'sort_order' => 21 ),
-            array( 'plan_type' => 'enterprise', 'billing_cycle' => 'monthly', 'price' => 1490,  'max_users' => null, 'recommended' => 0, 'custom_price' => 1, 'sort_order' => 30 ),
-            array( 'plan_type' => 'enterprise', 'billing_cycle' => 'yearly',  'price' => 14900, 'max_users' => null, 'recommended' => 0, 'custom_price' => 1, 'sort_order' => 31 ),
+            array( 'plan_type' => 'starter',    'billing_cycle' => 'monthly', 'price' => 290,   'max_users' => 3,    'included' => 3,    'seat_price' => 50,   'hard_limit' => 10,   'rec_at' => 80,   'recommended' => 0, 'custom_price' => 0, 'sort_order' => 10 ),
+            array( 'plan_type' => 'starter',    'billing_cycle' => 'yearly',  'price' => 2990,  'max_users' => 3,    'included' => 3,    'seat_price' => 50,   'hard_limit' => 10,   'rec_at' => 80,   'recommended' => 0, 'custom_price' => 0, 'sort_order' => 11 ),
+            array( 'plan_type' => 'business',   'billing_cycle' => 'monthly', 'price' => 690,   'max_users' => 10,   'included' => 10,   'seat_price' => 50,   'hard_limit' => 25,   'rec_at' => 80,   'recommended' => 1, 'custom_price' => 0, 'sort_order' => 20 ),
+            array( 'plan_type' => 'business',   'billing_cycle' => 'yearly',  'price' => 6900,  'max_users' => 10,   'included' => 10,   'seat_price' => 50,   'hard_limit' => 25,   'rec_at' => 80,   'recommended' => 1, 'custom_price' => 0, 'sort_order' => 21 ),
+            array( 'plan_type' => 'enterprise', 'billing_cycle' => 'monthly', 'price' => 1490,  'max_users' => null, 'included' => null, 'seat_price' => null, 'hard_limit' => null, 'rec_at' => null, 'recommended' => 0, 'custom_price' => 1, 'sort_order' => 30 ),
+            array( 'plan_type' => 'enterprise', 'billing_cycle' => 'yearly',  'price' => 14900, 'max_users' => null, 'included' => null, 'seat_price' => null, 'hard_limit' => null, 'rec_at' => null, 'recommended' => 0, 'custom_price' => 1, 'sort_order' => 31 ),
         );
         $taglines = array(
             'starter'    => 'מתאים לעסקים קטנים שמתחילים עם CMMS',
@@ -243,6 +383,10 @@ class CMMS_Plans {
                 'price'                => (float) $d['price'],
                 'currency'             => 'ILS',
                 'max_users'            => $d['max_users'],
+                'included_seats'       => $d['included'],
+                'seat_addon_price'     => $d['seat_price'],
+                'hard_user_limit'      => $d['hard_limit'],
+                'upgrade_recommended_at' => $d['rec_at'],
                 'billing_mode'         => $pt === 'enterprise' ? 'manual' : 'recurring',
                 'icredit_page_id'      => null,
                 'external_payment_reference' => null,

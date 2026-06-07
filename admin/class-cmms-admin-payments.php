@@ -8,7 +8,7 @@
  *   - Payments: ledger of every payment attempt (initial + recurring)
  *   - Subscriptions: active/past_due/frozen/canceled subscriptions
  *
- * Pure read-only on the Payments tab. The Subscriptions tab supports
+ * Pure read-only on the Payments tab. The Subscriptions tab supports 
  * cancellation — but only marks the row as canceled in our DB; the
  * admin must separately cancel the recurring sale in iCredit (we show
  * a clear warning about this).
@@ -29,6 +29,7 @@ class CMMS_Admin_Payments {
 
     public static function init() {
         add_action( 'admin_init', array( __CLASS__, 'maybe_handle_cancel' ) );
+        add_action( 'admin_init', array( __CLASS__, 'maybe_handle_seat_action' ) );
     }
 
     public static function render() {
@@ -319,7 +320,159 @@ class CMMS_Admin_Payments {
         $list_params = array_merge( $params, array( self::PER_PAGE, $offset ) );
         $rows = $wpdb->get_results( $wpdb->prepare( $list_sql, $list_params ), ARRAY_A );
 
+        // 1.14.74: Pending Recurring Updates section.
+        //
+        // Show subscriptions where pending_seats_change != 0. These are
+        // subs that have had a self-service seat addon paid (positive)
+        // or a scheduled seat removal (negative), and the iCredit
+        // recurring still needs to be updated manually by Super Admin
+        // to reflect the new monthly amount.
+        //
+        // Once Super Admin updates iCredit and clears the pending,
+        // the row disappears.
+        $packages_t   = CMMS_DB::table( 'packages' );
+        $pending_subs = $wpdb->get_results(
+            "SELECT s.*, a.name AS company_name,
+                    p.seat_addon_price AS seat_price,
+                    p.price AS base_price,
+                    p.included_seats AS included
+               FROM $subs_t s
+               LEFT JOIN $accounts_t a ON a.id = s.account_id
+               LEFT JOIN $packages_t p
+                      ON p.plan_type = s.plan_type
+                     AND p.billing_cycle = s.billing_cycle
+              WHERE s.pending_seats_change IS NOT NULL
+                AND s.pending_seats_change <> 0
+                AND s.status IN ('active','past_due')
+              ORDER BY s.updated_at DESC",
+            ARRAY_A
+        );
+
+        // Handle clear-pending POST action (admin marked as updated).
+        if ( isset( $_POST['cmms_clear_pending_sub_id'] )
+             && check_admin_referer( 'cmms_clear_pending_' . (int) $_POST['cmms_clear_pending_sub_id'], 'cmms_clear_pending_nonce' )
+             && current_user_can( self::CAP ) ) {
+            $clear_sub_id = (int) $_POST['cmms_clear_pending_sub_id'];
+            $sub_to_clear = $wpdb->get_row( $wpdb->prepare(
+                "SELECT * FROM $subs_t WHERE id = %d", $clear_sub_id
+            ), ARRAY_A );
+            if ( $sub_to_clear ) {
+                $pkg_for_sub = $wpdb->get_row( $wpdb->prepare(
+                    "SELECT price, seat_addon_price FROM $packages_t
+                      WHERE plan_type = %s AND billing_cycle = %s LIMIT 1",
+                    $sub_to_clear['plan_type'], $sub_to_clear['billing_cycle']
+                ), ARRAY_A );
+                $new_amount = $sub_to_clear['amount'];
+                if ( $pkg_for_sub ) {
+                    $new_amount = (float) $pkg_for_sub['price']
+                                + ( (int) $sub_to_clear['seats_purchased'] )
+                                  * (float) ( $pkg_for_sub['seat_addon_price'] ?: 0 );
+                }
+                $wpdb->update( $subs_t, array(
+                    'pending_seats_change' => null,
+                    'amount'               => $new_amount,
+                    'updated_at'           => current_time( 'mysql' ),
+                ), array( 'id' => $clear_sub_id ) );
+                echo '<div class="notice notice-success is-dismissible"><p>' . esc_html__( 'Marked as updated in iCredit.', 'cmms-light' ) . '</p></div>';
+                $pending_subs = $wpdb->get_results(
+                    "SELECT s.*, a.name AS company_name,
+                            p.seat_addon_price AS seat_price,
+                            p.price AS base_price,
+                            p.included_seats AS included
+                       FROM $subs_t s
+                       LEFT JOIN $accounts_t a ON a.id = s.account_id
+                       LEFT JOIN $packages_t p
+                              ON p.plan_type = s.plan_type
+                             AND p.billing_cycle = s.billing_cycle
+                      WHERE s.pending_seats_change IS NOT NULL
+                        AND s.pending_seats_change <> 0
+                        AND s.status IN ('active','past_due')
+                      ORDER BY s.updated_at DESC",
+                    ARRAY_A
+                );
+            }
+        }
         ?>
+
+        <?php if ( ! empty( $pending_subs ) ) : ?>
+        <div style="background:#fffbeb;border:1.5px solid #fcd34d;border-radius:8px;padding:14px 18px;margin:16px 0;">
+            <h2 style="margin:0 0 4px;font-size:15px;color:#78350f;">
+                ⚠️ <?php esc_html_e( 'Subscriptions Awaiting iCredit Recurring Update', 'cmms-light' ); ?>
+                (<?php echo count( $pending_subs ); ?>)
+            </h2>
+            <p style="margin:0 0 12px;color:#78350f;font-size:13px;">
+                <?php esc_html_e( "These customers paid for additional seats. Update their iCredit recurring amount to match the new monthly total, then click 'Mark as updated'.", 'cmms-light' ); ?>
+            </p>
+            <table class="wp-list-table widefat fixed striped" style="background:#fff;">
+                <thead>
+                    <tr>
+                        <th style="width:200px"><?php esc_html_e( 'Company', 'cmms-light' ); ?></th>
+                        <th style="width:120px"><?php esc_html_e( 'Plan', 'cmms-light' ); ?></th>
+                        <th style="width:130px"><?php esc_html_e( 'Recurring (Old)', 'cmms-light' ); ?></th>
+                        <th style="width:130px"><?php esc_html_e( 'Recurring (New)', 'cmms-light' ); ?></th>
+                        <th style="width:120px"><?php esc_html_e( 'Pending change', 'cmms-light' ); ?></th>
+                        <th style="width:140px"><?php esc_html_e( 'Next billing', 'cmms-light' ); ?></th>
+                        <th style="width:140px"><?php esc_html_e( 'iCredit RecurringId', 'cmms-light' ); ?></th>
+                        <th><?php esc_html_e( 'Action', 'cmms-light' ); ?></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ( $pending_subs as $psub ) :
+                        $pc = (int) $psub['pending_seats_change'];
+                        $current_seats = (int) $psub['seats_purchased'];
+                        $current_recurring = (float) $psub['amount'];
+                        $new_recurring = (float) $psub['base_price']
+                                       + $current_seats * (float) ( $psub['seat_price'] ?: 0 );
+                        $sub_view_url = add_query_arg( array(
+                            'page'        => self::SLUG,
+                            'tab'         => 'subscriptions',
+                            'cmms_action' => 'subscription_view',
+                            'id'          => (int) $psub['id'],
+                        ), admin_url( 'admin.php' ) );
+                    ?>
+                    <tr>
+                        <td><a href="<?php echo esc_url( $sub_view_url ); ?>"><strong><?php echo esc_html( $psub['company_name'] ?: '—' ); ?></strong></a></td>
+                        <td><?php echo esc_html( ucfirst( $psub['plan_type'] ) ); ?> / <?php echo esc_html( $psub['billing_cycle'] ); ?></td>
+                        <td>₪<?php echo esc_html( number_format( $current_recurring, 2 ) ); ?></td>
+                        <td><strong style="color:#047857;">₪<?php echo esc_html( number_format( $new_recurring, 2 ) ); ?></strong></td>
+                        <td>
+                            <?php if ( $pc > 0 ) : ?>
+                                <span style="color:#047857;">+<?php echo (int) $pc; ?> <?php esc_html_e( 'seats', 'cmms-light' ); ?></span>
+                            <?php else : ?>
+                                <span style="color:#a00;"><?php echo (int) $pc; ?> <?php esc_html_e( 'seats', 'cmms-light' ); ?></span>
+                            <?php endif; ?>
+                        </td>
+                        <td>
+                            <?php if ( ! empty( $psub['next_charge_at'] ) ) : ?>
+                                <?php echo esc_html( mysql2date( 'd/m/Y', $psub['next_charge_at'] ) ); ?>
+                            <?php else : ?>
+                                —
+                            <?php endif; ?>
+                        </td>
+                        <td>
+                            <?php if ( ! empty( $psub['external_subscription_id'] ) ) : ?>
+                                <code style="font-size:11px;"><?php echo esc_html( $psub['external_subscription_id'] ); ?></code>
+                            <?php else : ?>
+                                <span style="color:#94a3b8;">—</span>
+                            <?php endif; ?>
+                        </td>
+                        <td>
+                            <form method="post" action="" style="margin:0;">
+                                <?php wp_nonce_field( 'cmms_clear_pending_' . (int) $psub['id'], 'cmms_clear_pending_nonce' ); ?>
+                                <input type="hidden" name="cmms_clear_pending_sub_id" value="<?php echo (int) $psub['id']; ?>">
+                                <button type="submit" class="button button-small"
+                                        onclick="return confirm('<?php echo esc_js( __( 'Confirm: you have updated iCredit to charge the new amount?', 'cmms-light' ) ); ?>');">
+                                    <?php esc_html_e( 'Mark as updated', 'cmms-light' ); ?>
+                                </button>
+                            </form>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+        <?php endif; ?>
+
         <form method="get" action="" style="margin: 16px 0;">
             <input type="hidden" name="page" value="<?php echo esc_attr( self::SLUG ); ?>">
             <input type="hidden" name="tab" value="subscriptions">
@@ -507,6 +660,77 @@ class CMMS_Admin_Payments {
                         esc_html_e( 'No IPN received yet.', 'cmms-light' );
                     }
                 ?></textarea>
+
+                <?php // 1.14.79.1 — Debug payload from the iCredit request.
+                      // Captures the exact JSON we sent to iCredit GetUrl
+                      // and the response we got back. Helps diagnose
+                      // failures where the customer landed on rivhit.net
+                      // Error.htm with no IPN ever received. ?>
+                <h2 style="margin-top:32px;">🔍 <?php esc_html_e( 'Debug Info — Request to iCredit', 'cmms-light' ); ?></h2>
+                <p class="description"><?php esc_html_e( 'Snapshot of what was sent to iCredit and what came back. The GroupPrivateToken is redacted for security.', 'cmms-light' ); ?></p>
+                <?php
+                $has_debug_col = ! empty( $row['debug_payload'] );
+                if ( $has_debug_col ) {
+                    $debug_decoded = json_decode( $row['debug_payload'], true );
+                    if ( is_array( $debug_decoded ) ) {
+                        // Pretty summary box at the top.
+                        $http_code = $debug_decoded['http_code'] ?? '?';
+                        $duration  = $debug_decoded['duration_ms'] ?? '?';
+                        $outcome   = $debug_decoded['http_outcome'] ?? '?';
+                        $parsed    = $debug_decoded['response_parsed'] ?? null;
+                        $icredit_status = is_array( $parsed ) && isset( $parsed['Status'] ) ? (int) $parsed['Status'] : null;
+                        $icredit_url    = is_array( $parsed ) ? ( $parsed['URL'] ?? '' ) : '';
+                        ?>
+                        <table class="widefat" style="max-width:800px;margin-bottom:14px;">
+                            <tbody>
+                                <tr><th style="width:200px;"><?php esc_html_e( 'Attempted at', 'cmms-light' ); ?></th>
+                                    <td><?php echo esc_html( $debug_decoded['attempted_at'] ?? '—' ); ?></td></tr>
+                                <tr><th>HTTP outcome</th>
+                                    <td><code><?php echo esc_html( $outcome ); ?></code></td></tr>
+                                <tr><th>HTTP status code</th>
+                                    <td><strong style="color:<?php echo ( is_numeric( $http_code ) && $http_code >= 200 && $http_code < 300 ) ? '#047857' : '#b91c1c'; ?>;"><?php echo esc_html( $http_code ); ?></strong></td></tr>
+                                <tr><th>Duration</th>
+                                    <td><?php echo esc_html( $duration ); ?> ms</td></tr>
+                                <?php if ( $icredit_status !== null ) : ?>
+                                <tr><th>iCredit Status field</th>
+                                    <td>
+                                        <strong style="color:<?php echo $icredit_status === 0 ? '#047857' : '#b91c1c'; ?>;">
+                                            <?php echo (int) $icredit_status; ?>
+                                            <?php echo $icredit_status === 0 ? ' ✓ (OK)' : ' ✗ (rejected)'; ?>
+                                        </strong>
+                                    </td></tr>
+                                <?php endif; ?>
+                                <?php if ( $icredit_url ) : ?>
+                                <tr><th>Returned URL</th>
+                                    <td style="word-break:break-all;"><a href="<?php echo esc_url( $icredit_url ); ?>" target="_blank" rel="noopener"><?php echo esc_html( $icredit_url ); ?></a></td></tr>
+                                <?php endif; ?>
+                            </tbody>
+                        </table>
+                        <details style="margin-top:14px;">
+                            <summary style="cursor:pointer;font-weight:600;padding:6px 0;"><?php esc_html_e( 'Full Request Payload (click to expand)', 'cmms-light' ); ?></summary>
+                            <textarea readonly rows="20" class="large-text code" style="font-family:monospace; font-size:11px; margin-top:8px;"><?php
+                                echo esc_textarea( wp_json_encode( $debug_decoded['request_payload'] ?? null, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ) );
+                            ?></textarea>
+                        </details>
+                        <details style="margin-top:8px;">
+                            <summary style="cursor:pointer;font-weight:600;padding:6px 0;"><?php esc_html_e( 'Full Response Body (click to expand)', 'cmms-light' ); ?></summary>
+                            <textarea readonly rows="20" class="large-text code" style="font-family:monospace; font-size:11px; margin-top:8px;"><?php
+                                $body_to_show = $debug_decoded['response_parsed']
+                                    ?? $debug_decoded['response_body']
+                                    ?? '(empty)';
+                                echo esc_textarea( is_array( $body_to_show )
+                                    ? wp_json_encode( $body_to_show, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE )
+                                    : $body_to_show );
+                            ?></textarea>
+                        </details>
+                        <?php
+                    } else {
+                        echo '<pre style="background:#f6f7f7;padding:12px;border-radius:6px;overflow:auto;">' . esc_html( $row['debug_payload'] ) . '</pre>';
+                    }
+                } else {
+                    echo '<p><em>' . esc_html__( 'No debug data captured (payment was created before 1.14.79.1, or the request never reached iCredit).', 'cmms-light' ) . '</em></p>';
+                }
+                ?>
             <?php endif; ?>
         </div>
         <?php
@@ -609,6 +833,211 @@ class CMMS_Admin_Payments {
                     </table>
                 <?php endif; ?>
 
+                <?php // ─────────────────────────────────────────────────
+                      // 1.14.71 — Seat Management section (Super Admin)
+                      //
+                      // Lets the admin:
+                      //   - See current seat status (used / allowed / hard limit)
+                      //   - Add seats immediately (DB-only; manual billing)
+                      //   - Schedule seat removal for next billing cycle
+                      //   - Cancel a scheduled removal
+                      //
+                      // No iCredit calls happen here in Phase 1. Admin
+                      // handles invoicing manually.
+                      // ─────────────────────────────────────────────────
+                      $seat_info = class_exists( 'CMMS_Seats' )
+                          ? CMMS_Seats::get_account_seats( (int) $sub['account_id'] )
+                          : null;
+
+                      // Status messages from previous action.
+                      $seat_msg = isset( $_GET['cmms_seat_msg'] ) ? sanitize_key( wp_unslash( $_GET['cmms_seat_msg'] ) ) : '';
+                      $seat_err = isset( $_GET['cmms_seat_err'] ) ? wp_unslash( $_GET['cmms_seat_err'] ) : '';
+                ?>
+                <h2 style="margin-top:32px;"><?php esc_html_e( 'Seat Management', 'cmms-light' ); ?></h2>
+
+                <?php if ( $seat_msg ) : ?>
+                    <div class="notice notice-success inline" style="margin:0 0 12px;">
+                        <p>
+                        <?php
+                        if     ( $seat_msg === 'added' )            esc_html_e( 'Seats added successfully.', 'cmms-light' );
+                        elseif ( $seat_msg === 'removal_scheduled' ) esc_html_e( 'Seat removal scheduled for next billing cycle.', 'cmms-light' );
+                        elseif ( $seat_msg === 'change_cancelled' ) esc_html_e( 'Scheduled seat change cancelled.', 'cmms-light' );
+                        ?>
+                        </p>
+                    </div>
+                <?php endif; ?>
+
+                <?php if ( $seat_err ) : ?>
+                    <div class="notice notice-error inline" style="margin:0 0 12px;">
+                        <p><?php echo esc_html( urldecode( $seat_err ) ); ?></p>
+                    </div>
+                <?php endif; ?>
+
+                <?php if ( ! $seat_info || ! $seat_info['is_managed'] ) : ?>
+                    <div style="background:#f0f0f1;border:1px solid #ccd0d4;border-radius:6px;padding:14px 18px;">
+                        <p style="margin:0;">
+                            <strong><?php esc_html_e( 'Unmanaged plan', 'cmms-light' ); ?></strong> —
+                            <?php esc_html_e( 'This account is on Enterprise / custom pricing. Seats are not managed automatically. Edit max_users on the account directly to change limits.', 'cmms-light' ); ?>
+                        </p>
+                    </div>
+                <?php else : ?>
+
+                    <table class="form-table" role="presentation">
+                        <tbody>
+                            <tr>
+                                <th scope="row"><?php esc_html_e( 'Plan', 'cmms-light' ); ?></th>
+                                <td>
+                                    <?php echo esc_html( ucfirst( $seat_info['plan_type'] ) ); ?>
+                                    / <?php echo esc_html( $seat_info['billing_cycle'] ); ?>
+                                </td>
+                            </tr>
+                            <tr>
+                                <th scope="row"><?php esc_html_e( 'Included seats', 'cmms-light' ); ?></th>
+                                <td><?php echo (int) $seat_info['included']; ?></td>
+                            </tr>
+                            <tr>
+                                <th scope="row"><?php esc_html_e( 'Purchased extras', 'cmms-light' ); ?></th>
+                                <td>
+                                    <?php echo (int) $seat_info['purchased']; ?>
+                                    <?php if ( $seat_info['seat_price'] !== null ) : ?>
+                                        <span style="color:#646970;">
+                                            (₪<?php echo esc_html( number_format( (float) $seat_info['seat_price'], 2 ) ); ?>
+                                            <?php esc_html_e( 'per seat / cycle', 'cmms-light' ); ?>)
+                                        </span>
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                            <tr>
+                                <th scope="row"><strong><?php esc_html_e( 'Total allowed', 'cmms-light' ); ?></strong></th>
+                                <td>
+                                    <strong style="font-size:16px;"><?php echo (int) $seat_info['total_allowed']; ?></strong>
+                                    <?php if ( $seat_info['hard_limit'] !== null ) : ?>
+                                        <span style="color:#646970;">
+                                            (<?php esc_html_e( 'hard limit:', 'cmms-light' ); ?> <?php echo (int) $seat_info['hard_limit']; ?>)
+                                        </span>
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                            <tr>
+                                <th scope="row"><?php esc_html_e( 'Currently in use', 'cmms-light' ); ?></th>
+                                <td>
+                                    <strong><?php echo (int) $seat_info['currently_used']; ?></strong>
+                                    /
+                                    <?php echo (int) $seat_info['total_allowed']; ?>
+                                    <?php if ( $seat_info['upgrade_recommended'] ) : ?>
+                                        <span style="color:#dba617;margin-inline-start:8px;">⚠ <?php esc_html_e( 'Approaching hard limit — upgrade recommended', 'cmms-light' ); ?></span>
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                            <?php if ( $seat_info['pending_change'] != 0 ) :
+                                $pc = (int) $seat_info['pending_change']; ?>
+                                <tr>
+                                    <th scope="row"><?php esc_html_e( 'Pending change', 'cmms-light' ); ?></th>
+                                    <td>
+                                        <?php if ( $pc < 0 ) : ?>
+                                            <span style="color:#a00;">
+                                                <?php printf( esc_html__( 'Removal of %d seats scheduled for next billing cycle', 'cmms-light' ), abs( $pc ) ); ?>
+                                            </span>
+                                            <?php
+                                            $cancel_url = wp_nonce_url(
+                                                add_query_arg( array(
+                                                    'page'                  => self::SLUG,
+                                                    'cmms_action'           => 'subscription_view',
+                                                    'id'                    => $id,
+                                                    'cmms_seat_action'      => 'cancel_change',
+                                                ), admin_url( 'admin.php' ) ),
+                                                'cmms_seat_cancel_' . $id
+                                            );
+                                            ?>
+                                            <a href="<?php echo esc_url( $cancel_url ); ?>" class="button button-small" style="margin-inline-start:8px;">
+                                                <?php esc_html_e( 'Cancel scheduled change', 'cmms-light' ); ?>
+                                            </a>
+                                        <?php endif; ?>
+                                    </td>
+                                </tr>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+
+                    <div style="display:flex;gap:20px;flex-wrap:wrap;margin-top:24px;">
+
+                        <!-- Add seats form -->
+                        <div style="flex:1 1 320px;background:#f6f7f7;border:1px solid #ccd0d4;border-radius:6px;padding:18px;">
+                            <h3 style="margin-top:0;"><?php esc_html_e( 'Add seats', 'cmms-light' ); ?></h3>
+                            <p class="description" style="margin-top:0;">
+                                <?php esc_html_e( 'Adds seats immediately. Billing is manual — invoice the customer separately.', 'cmms-light' ); ?>
+                            </p>
+                            <?php
+                            $room_left = ( $seat_info['hard_limit'] !== null )
+                                ? max( 0, $seat_info['hard_limit'] - $seat_info['total_allowed'] )
+                                : 999;
+                            ?>
+                            <?php if ( $room_left <= 0 ) : ?>
+                                <p style="color:#a00;">
+                                    <strong><?php esc_html_e( 'Hard limit reached.', 'cmms-light' ); ?></strong>
+                                    <?php esc_html_e( 'Upgrade the plan to add more seats.', 'cmms-light' ); ?>
+                                </p>
+                            <?php else : ?>
+                                <form method="post" action="<?php echo esc_url( admin_url( 'admin.php' ) ); ?>" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">
+                                    <?php wp_nonce_field( 'cmms_seat_add_' . $id, 'cmms_seat_nonce' ); ?>
+                                    <input type="hidden" name="page" value="<?php echo esc_attr( self::SLUG ); ?>">
+                                    <input type="hidden" name="cmms_action" value="subscription_view">
+                                    <input type="hidden" name="id" value="<?php echo (int) $id; ?>">
+                                    <input type="hidden" name="cmms_seat_action" value="add">
+                                    <div>
+                                        <label for="seat_count" style="display:block;font-weight:600;margin-bottom:4px;">
+                                            <?php esc_html_e( 'How many to add', 'cmms-light' ); ?>
+                                        </label>
+                                        <input type="number" id="seat_count" name="seat_count"
+                                               min="1" max="<?php echo (int) $room_left; ?>" value="1"
+                                               style="width:100px;">
+                                    </div>
+                                    <button type="submit" class="button button-primary"
+                                            onclick="return confirm('<?php echo esc_js( __( 'Add seats immediately? Bill the customer separately.', 'cmms-light' ) ); ?>');">
+                                        <?php esc_html_e( 'Add seats', 'cmms-light' ); ?>
+                                    </button>
+                                </form>
+                                <p class="description" style="margin-bottom:0;">
+                                    <?php printf(
+                                        esc_html__( 'Room left until hard limit: %d', 'cmms-light' ),
+                                        $room_left
+                                    ); ?>
+                                </p>
+                            <?php endif; ?>
+                        </div>
+
+                        <!-- Remove seats form -->
+                        <?php if ( $seat_info['purchased'] > 0 && $seat_info['pending_change'] == 0 ) : ?>
+                        <div style="flex:1 1 320px;background:#f6f7f7;border:1px solid #ccd0d4;border-radius:6px;padding:18px;">
+                            <h3 style="margin-top:0;"><?php esc_html_e( 'Remove seats (scheduled)', 'cmms-light' ); ?></h3>
+                            <p class="description" style="margin-top:0;">
+                                <?php esc_html_e( 'Schedules seat removal for next billing cycle. No refunds. The customer keeps full access until then.', 'cmms-light' ); ?>
+                            </p>
+                            <form method="post" action="<?php echo esc_url( admin_url( 'admin.php' ) ); ?>" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">
+                                <?php wp_nonce_field( 'cmms_seat_remove_' . $id, 'cmms_seat_nonce' ); ?>
+                                <input type="hidden" name="page" value="<?php echo esc_attr( self::SLUG ); ?>">
+                                <input type="hidden" name="cmms_action" value="subscription_view">
+                                <input type="hidden" name="id" value="<?php echo (int) $id; ?>">
+                                <input type="hidden" name="cmms_seat_action" value="remove">
+                                <div>
+                                    <label for="seat_count_rm" style="display:block;font-weight:600;margin-bottom:4px;">
+                                        <?php esc_html_e( 'How many to schedule', 'cmms-light' ); ?>
+                                    </label>
+                                    <input type="number" id="seat_count_rm" name="seat_count"
+                                           min="1" max="<?php echo (int) $seat_info['purchased']; ?>" value="1"
+                                           style="width:100px;">
+                                </div>
+                                <button type="submit" class="button"
+                                        onclick="return confirm('<?php echo esc_js( __( 'Schedule seat removal for next billing cycle?', 'cmms-light' ) ); ?>');">
+                                    <?php esc_html_e( 'Schedule removal', 'cmms-light' ); ?>
+                                </button>
+                            </form>
+                        </div>
+                        <?php endif; ?>
+
+                    </div>
+                <?php endif; ?>
+
                 <?php if ( $sub['status'] !== 'canceled' ) :
                     $cancel_url = wp_nonce_url(
                         add_query_arg( array(
@@ -667,6 +1096,94 @@ class CMMS_Admin_Payments {
             'canceled' => 1,
         ), admin_url( 'admin.php' ) ) );
         exit;
+    }
+
+    /* ============================================================
+       1.14.71 — SEAT ACTION HANDLER
+
+       Handles POST submissions (and GET for cancel_change) from the
+       Seat Management panel in the subscription detail view.
+
+       Actions:
+         - add             : POST, ?cmms_seat_action=add
+         - remove          : POST, ?cmms_seat_action=remove
+         - cancel_change   : GET,  ?cmms_seat_action=cancel_change
+
+       Nonces:
+         - cmms_seat_add_{id}     for add
+         - cmms_seat_remove_{id}  for remove
+         - cmms_seat_cancel_{id}  for cancel_change
+
+       After processing, always redirects back to the subscription
+       detail view with cmms_seat_msg or cmms_seat_err set so the
+       user sees feedback.
+    ============================================================ */
+    public static function maybe_handle_seat_action() {
+        if ( empty( $_REQUEST['cmms_seat_action'] ) ) return;
+        if ( ! current_user_can( self::CAP ) ) return;
+
+        $sub_id = isset( $_REQUEST['id'] ) ? (int) $_REQUEST['id'] : 0;
+        $action = sanitize_key( wp_unslash( $_REQUEST['cmms_seat_action'] ) );
+        if ( ! $sub_id || ! $action ) return;
+        if ( ! class_exists( 'CMMS_Seats' ) ) return;
+
+        // Resolve account_id from subscription_id.
+        global $wpdb;
+        $subs_t     = CMMS_DB::table( 'subscriptions' );
+        $account_id = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT account_id FROM $subs_t WHERE id = %d",
+            $sub_id
+        ) );
+        if ( ! $account_id ) return;
+
+        $redirect_base = add_query_arg( array(
+            'page'        => self::SLUG,
+            'cmms_action' => 'subscription_view',
+            'id'          => $sub_id,
+        ), admin_url( 'admin.php' ) );
+
+        $result = null;
+
+        if ( $action === 'add' ) {
+            check_admin_referer( 'cmms_seat_add_' . $sub_id, 'cmms_seat_nonce' );
+            $count = isset( $_POST['seat_count'] ) ? (int) $_POST['seat_count'] : 0;
+            $result = CMMS_Seats::add_seats_admin( $account_id, $count );
+
+            if ( is_wp_error( $result ) ) {
+                wp_safe_redirect( add_query_arg(
+                    'cmms_seat_err',
+                    rawurlencode( $result->get_error_message() ),
+                    $redirect_base
+                ) );
+                exit;
+            }
+            wp_safe_redirect( add_query_arg( 'cmms_seat_msg', 'added', $redirect_base ) );
+            exit;
+        }
+
+        if ( $action === 'remove' ) {
+            check_admin_referer( 'cmms_seat_remove_' . $sub_id, 'cmms_seat_nonce' );
+            $count = isset( $_POST['seat_count'] ) ? (int) $_POST['seat_count'] : 0;
+            $result = CMMS_Seats::remove_seats_admin( $account_id, $count );
+
+            if ( is_wp_error( $result ) ) {
+                wp_safe_redirect( add_query_arg(
+                    'cmms_seat_err',
+                    rawurlencode( $result->get_error_message() ),
+                    $redirect_base
+                ) );
+                exit;
+            }
+            wp_safe_redirect( add_query_arg( 'cmms_seat_msg', 'removal_scheduled', $redirect_base ) );
+            exit;
+        }
+
+        if ( $action === 'cancel_change' ) {
+            check_admin_referer( 'cmms_seat_cancel_' . $sub_id );
+            CMMS_Seats::cancel_scheduled_change( $account_id );
+            wp_safe_redirect( add_query_arg( 'cmms_seat_msg', 'change_cancelled', $redirect_base ) );
+            exit;
+        }
     }
 
     /* ============================================================

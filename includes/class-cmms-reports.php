@@ -39,9 +39,11 @@ class CMMS_Reports {
         $account_id = (int) $account_id;
 
         // ---- snapshot metrics (always "as of now", ignore range) ----
+        // 1.14.83: All report queries exclude soft-deleted tasks.
         $open_count = (int) $wpdb->get_var( $wpdb->prepare(
             "SELECT COUNT(*) FROM $tasks_t
-              WHERE account_id = %d AND status IN ('open','in_progress','waiting')",
+              WHERE account_id = %d AND status IN ('open','in_progress','waiting')
+                AND deleted_at IS NULL",
             $account_id
         ) );
 
@@ -53,7 +55,8 @@ class CMMS_Reports {
               WHERE account_id = %d
                 AND status IN ('open','in_progress','waiting')
                 AND due_date IS NOT NULL
-                AND due_date < %s",
+                AND due_date < %s
+                AND deleted_at IS NULL",
             $account_id, current_time( 'mysql' )
         ) );
 
@@ -66,7 +69,8 @@ class CMMS_Reports {
             "SELECT COUNT(*) FROM $tasks_t
               WHERE account_id = %d
                 AND completed_at IS NOT NULL
-                AND completed_at >= %s",
+                AND completed_at >= %s
+                AND deleted_at IS NULL",
             $account_id, $week_ago
         ) );
 
@@ -77,7 +81,8 @@ class CMMS_Reports {
         $avg_response_minutes = $wpdb->get_var( $wpdb->prepare(
             "SELECT AVG(TIMESTAMPDIFF(MINUTE, created_at, started_at))
                FROM $tasks_t
-              WHERE account_id = %d AND started_at IS NOT NULL",
+              WHERE account_id = %d AND started_at IS NOT NULL
+                AND deleted_at IS NULL",
             $account_id
         ) );
         $avg_response_minutes = $avg_response_minutes !== null
@@ -89,7 +94,8 @@ class CMMS_Reports {
         $avg_closure_hours = $wpdb->get_var( $wpdb->prepare(
             "SELECT AVG(TIMESTAMPDIFF(HOUR, created_at, completed_at))
                FROM $tasks_t
-              WHERE account_id = %d AND completed_at IS NOT NULL",
+              WHERE account_id = %d AND completed_at IS NOT NULL
+                AND deleted_at IS NULL",
             $account_id
         ) );
         $avg_closure_hours = $avg_closure_hours !== null
@@ -108,7 +114,8 @@ class CMMS_Reports {
                FROM $tasks_t
               WHERE account_id = %d
                 AND completed_at IS NOT NULL
-                AND due_date IS NOT NULL",
+                AND due_date IS NOT NULL
+                AND deleted_at IS NULL",
             $account_id
         ) );
         $sla_compliance_pct = ( $sla_row && (int) $sla_row->measured > 0 )
@@ -123,6 +130,7 @@ class CMMS_Reports {
                INNER JOIN $tasks_t t ON t.assigned_to = u.id
               WHERE u.account_id = %d
                 AND t.status IN ('open','in_progress','waiting')
+                AND t.deleted_at IS NULL
               GROUP BY u.id, u.display_name
               ORDER BY open_count DESC
               LIMIT 1",
@@ -148,7 +156,7 @@ class CMMS_Reports {
             "SELECT a.id, a.name, COUNT(t.id) AS task_count
                FROM $assets_t a
                INNER JOIN $tasks_t t ON t.asset_id = a.id
-              WHERE a.account_id = %d $window_clause
+              WHERE a.account_id = %d AND t.deleted_at IS NULL $window_clause
               GROUP BY a.id, a.name
               ORDER BY task_count DESC
               LIMIT 1",

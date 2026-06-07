@@ -28,13 +28,14 @@ class CMMS_Forms {
             'description'          => isset( $data['description'] ) ? wp_kses_post( $data['description'] ) : '',
             'slug'                 => $slug,
             'manager_id'           => isset( $data['manager_id'] ) ? intval( $data['manager_id'] ) : null,
+            'default_assignee_id'  => isset( $data['default_assignee_id'] ) ? intval( $data['default_assignee_id'] ) : null,
             'default_category_id'  => isset( $data['default_category_id'] ) ? intval( $data['default_category_id'] ) : null,
             'default_priority'     => isset( $data['default_priority'] ) ? sanitize_text_field( $data['default_priority'] ) : 'normal',
             'default_status'       => isset( $data['default_status'] ) ? sanitize_text_field( $data['default_status'] ) : 'open',
             'enabled'              => 1,
             'created_by'           => isset( $data['created_by'] ) ? intval( $data['created_by'] ) : null,
             'created_at'           => current_time( 'mysql' ),
-        ), array( '%d','%s','%s','%s','%d','%d','%s','%s','%d','%d','%s' ) );
+        ), array( '%d','%s','%s','%s','%d','%d','%d','%s','%s','%d','%d','%s' ) );
         return $wpdb->insert_id;
     }
 
@@ -45,6 +46,7 @@ class CMMS_Forms {
         $format = array();
         $map = array(
             'name' => '%s', 'description' => '%s', 'manager_id' => '%d',
+            'default_assignee_id' => '%d',
             'default_category_id' => '%d', 'default_priority' => '%s', 'default_status' => '%s', 'enabled' => '%d',
         );
         foreach ( $map as $k => $fmt ) {
@@ -165,8 +167,19 @@ class CMMS_Forms {
 
     /**
      * Process a public form submission.
+     *
+     * @param string $slug          Form slug.
+     * @param array  $post_data     Field values keyed by 'field_<id>'.
+     * @param array  $files         Optional file uploads keyed by 'field_<id>'.
+     * @param bool   $skip_required If true (webhook mode), missing required
+     *                              fields don't fail — they're just left empty.
+     *                              Set true for API/webhook submissions where
+     *                              the sender already decided what to send.
+     * @param string $source_type   'public_form' (default, browser submission)
+     *                              or 'webhook' (REST API submission). Stored
+     *                              on the submission row for reporting.
      */
-    public static function process_submission( $slug, $post_data, $files = array() ) {
+    public static function process_submission( $slug, $post_data, $files = array(), $skip_required = false, $source_type = 'public_form' ) {
         $form = self::get_by_slug( $slug );
         if ( ! $form || ! $form->enabled ) return new WP_Error( 'not_found', __( 'Form not available', 'cmms-light' ) );
 
@@ -208,7 +221,11 @@ class CMMS_Forms {
             } else {
                 $val = isset( $post_data[ $key ] ) ? sanitize_textarea_field( $post_data[ $key ] ) : '';
             }
-            if ( $field->required && $field->field_type !== 'file' ) {
+            // Required validation. Webhook mode (skip_required=true) deliberately
+            // skips this — the external system has already decided what to send,
+            // and rejecting incomplete payloads would just cause lost tickets.
+            // See process_webhook for the rationale.
+            if ( ! $skip_required && $field->required && $field->field_type !== 'file' ) {
                 $is_empty = false;
                 if ( $field->field_type === 'checkbox' ) {
                     if ( ! empty( $field_options ) ) {
@@ -242,18 +259,76 @@ class CMMS_Forms {
             }
         }
 
+        // Title fallback. For webhooks, the caller may pass an explicit
+        // 'title' override in post_data (the webhook handler does this for
+        // the standard 'title' API field). Honor that before falling back
+        // to first text-field value or the generated default.
+        if ( ! empty( $post_data['__webhook_title'] ) ) {
+            $task_title = sanitize_text_field( $post_data['__webhook_title'] );
+        }
         if ( empty( $task_title ) ) {
-            $task_title = $form->name . ' - ' . current_time( 'Y-m-d H:i' );
+            // 1.14.94: per the webhook spec, when no title can be derived
+            // we use a stable Hebrew default rather than auto-generating
+            // one from the form name + timestamp. This keeps webhook-created
+            // tasks visually distinct in the task list.
+            $task_title = $source_type === 'webhook'
+                ? __( 'New task', 'cmms-light' )
+                : ( $form->name . ' - ' . current_time( 'Y-m-d H:i' ) );
+        }
+
+        // Webhook callers can override the standard task fields by passing
+        // them via __webhook_* keys (set by CMMS_Webhook::process). These
+        // are not visible to public-form submitters.
+        $task_description = implode( "\n", $description_lines );
+        if ( isset( $post_data['__webhook_description'] ) && $post_data['__webhook_description'] !== '' ) {
+            $task_description = wp_kses_post( $post_data['__webhook_description'] );
+            // If both a description AND field answers exist, keep both.
+            if ( ! empty( $description_lines ) ) {
+                $task_description .= "\n\n" . implode( "\n", $description_lines );
+            }
+        }
+        $task_priority = $form->default_priority;
+        if ( ! empty( $post_data['__webhook_priority'] ) ) {
+            $task_priority = sanitize_text_field( $post_data['__webhook_priority'] );
+        }
+        $task_status = $form->default_status;
+        if ( ! empty( $post_data['__webhook_status'] ) ) {
+            $task_status = sanitize_text_field( $post_data['__webhook_status'] );
+        }
+
+        // 1.15.11: Resolve assignee + manager. Start from the form's
+        // defaults, then let a webhook override them per-request. Any
+        // overriding user id must belong to the same account — we never
+        // trust a raw id from the request.
+        $task_manager  = ! empty( $form->manager_id ) ? (int) $form->manager_id : null;
+        $task_assignee = ! empty( $form->default_assignee_id ) ? (int) $form->default_assignee_id : null;
+
+        if ( ! empty( $post_data['__webhook_manager_id'] ) ) {
+            $cand = (int) $post_data['__webhook_manager_id'];
+            $cu = CMMS_Users::get( $cand );
+            if ( $cu && (int) $cu->account_id === (int) $form->account_id ) {
+                $task_manager = $cand;
+            }
+        }
+        if ( ! empty( $post_data['__webhook_assignee_id'] ) ) {
+            $cand = (int) $post_data['__webhook_assignee_id'];
+            $cu = CMMS_Users::get( $cand );
+            if ( $cu && (int) $cu->account_id === (int) $form->account_id ) {
+                $task_assignee = $cand;
+            }
         }
 
         $task_id = CMMS_Tasks::create( $form->account_id, array(
             'title'        => $task_title,
-            'description'  => implode( "\n", $description_lines ),
+            'description'  => $task_description,
             'category_id'  => $form->default_category_id,
-            'manager_id'   => $form->manager_id,
-            'priority'     => $form->default_priority,
-            'status'       => $form->default_status,
-            'source'       => 'External Form',
+            'manager_id'   => $task_manager,
+            // 1.15.11: default assignee ("מוקצה ל") — the technician who
+            // performs the work. Form default, overridable via webhook.
+            'assigned_to'  => $task_assignee,
+            'priority'     => $task_priority,
+            'status'       => $task_status,
+            'source'       => $source_type === 'webhook' ? 'Webhook API' : 'External Form',
             'external_data'=> $answers,
         ) );
 
@@ -261,13 +336,14 @@ class CMMS_Forms {
 
         global $wpdb;
         $wpdb->insert( CMMS_DB::table( 'form_submissions' ), array(
-            'form_id'    => $form->id,
-            'account_id' => $form->account_id,
-            'task_id'    => $task_id,
-            'data'       => wp_json_encode( $answers ),
-            'ip_address' => isset( $_SERVER['REMOTE_ADDR'] ) ? sanitize_text_field( $_SERVER['REMOTE_ADDR'] ) : '',
-            'created_at' => current_time( 'mysql' ),
-        ), array( '%d','%d','%d','%s','%s','%s' ) );
+            'form_id'     => $form->id,
+            'account_id'  => $form->account_id,
+            'task_id'     => $task_id,
+            'data'        => wp_json_encode( $answers ),
+            'ip_address'  => isset( $_SERVER['REMOTE_ADDR'] ) ? sanitize_text_field( $_SERVER['REMOTE_ADDR'] ) : '',
+            'source_type' => $source_type,
+            'created_at'  => current_time( 'mysql' ),
+        ), array( '%d','%d','%d','%s','%s','%s','%s' ) );
 
         // Handle file uploads
         if ( ! empty( $files ) ) {

@@ -13,6 +13,11 @@ if ( ! defined( 'ABSPATH' ) ) exit;
 
 class CMMS_Shortcodes {
 
+    // 1.15.8: Cache of account members for inline-assign dropdowns in
+    // the task list. Loaded once per request (lazily) to avoid a query
+    // per card. Keyed by account_id.
+    private $assign_members_cache = array();
+
     public function __construct() {
         add_shortcode( 'cmms_signup',      array( $this, 'render_signup' ) );
         add_shortcode( 'cmms_login',       array( $this, 'render_login' ) );
@@ -681,6 +686,22 @@ body > footer,
             $selected_cycle = CMMS_Plans::default_cycle();
         }
 
+        // 1.14.72: read selected user count (seats) from URL. Defaults
+        // to the included_seats of the chosen plan when not provided.
+        // Bounded by [included, hard_user_limit] for managed plans.
+        $included_for_plan = CMMS_Plans::included_seats( $selected_plan, $selected_cycle );
+        $hard_for_plan     = CMMS_Plans::hard_user_limit( $selected_plan, $selected_cycle );
+        $selected_users    = isset( $_GET['users'] ) ? (int) $_GET['users'] : 0;
+        if ( $selected_users <= 0 ) {
+            $selected_users = ( $included_for_plan !== null ) ? $included_for_plan : 1;
+        }
+        if ( $included_for_plan !== null && $selected_users < $included_for_plan ) {
+            $selected_users = $included_for_plan;
+        }
+        if ( $hard_for_plan !== null && $selected_users > $hard_for_plan ) {
+            $selected_users = $hard_for_plan;
+        }
+
         // Guardrail: if someone lands on step=2 without a plan in the URL
         // and without sessionStorage backup, we still let them through —
         // the JS on step 2 will restore from sessionStorage if available,
@@ -1211,6 +1232,115 @@ body > footer,
     margin-top: 3px;
 }
 
+/* ─────────────────────────────────────────────────────────────────
+   1.14.72 — Seat Selector
+   Each managed plan card has its own selector. Lives between the
+   price block and the features list. Mobile-first.
+───────────────────────────────────────────────────────────────── */
+.cmms-onb-seats {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 12px 14px;
+    margin: 0 0 18px;
+}
+.cmms-onb-seats-label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    color: #64748b;
+    margin-bottom: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+.cmms-onb-seats-control {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    background: #fff;
+    border: 1.5px solid #cbd5e1;
+    border-radius: 8px;
+    overflow: hidden;
+    height: 42px;
+}
+.cmms-onb-seats-btn {
+    flex: none;
+    width: 40px;
+    background: #fff;
+    border: 0;
+    color: #475569;
+    font-size: 20px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s ease;
+    line-height: 1;
+    padding: 0;
+}
+.cmms-onb-seats-btn:hover:not(:disabled) {
+    background: #f1f5f9;
+    color: #0b1c33;
+}
+.cmms-onb-seats-btn:active:not(:disabled) {
+    background: #e2e8f0;
+}
+.cmms-onb-seats-btn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+}
+.cmms-onb-seats-input {
+    flex: 1 1 auto;
+    width: 100%;
+    border: 0;
+    border-inline: 1.5px solid #e2e8f0;
+    text-align: center;
+    font-size: 17px;
+    font-weight: 700;
+    color: #0b1c33;
+    background: #fff;
+    padding: 0;
+    -moz-appearance: textfield;
+    appearance: textfield;
+}
+.cmms-onb-seats-input::-webkit-outer-spin-button,
+.cmms-onb-seats-input::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+.cmms-onb-seats-input:focus {
+    outline: 0;
+    background: #fffbf5;
+}
+.cmms-onb-seats-hint {
+    margin-top: 8px;
+    font-size: 12px;
+    color: #64748b;
+    line-height: 1.5;
+}
+.cmms-onb-seats-recommendation {
+    margin-top: 8px;
+    padding: 8px 10px;
+    background: #fef3c7;
+    border: 1px solid #fcd34d;
+    border-radius: 6px;
+    color: #78350f;
+    font-size: 13px;
+    line-height: 1.4;
+    font-weight: 500;
+}
+.cmms-onb-seats-recommendation[hidden] { display: none; }
+.cmms-onb-seats-warning {
+    margin-top: 8px;
+    padding: 8px 10px;
+    background: #fee2e2;
+    border: 1px solid #fca5a5;
+    border-radius: 6px;
+    color: #7f1d1d;
+    font-size: 13px;
+    line-height: 1.4;
+    font-weight: 500;
+}
+.cmms-onb-seats-warning[hidden] { display: none; }
+
 .cmms-onb-plan-cta {
     display: block;
     width: 100%;
@@ -1488,14 +1618,44 @@ body > footer,
                 $plan_id = $plan['id'];
                 $is_recommended = ! empty( $plan['recommended'] );
                 $is_selected = ( $plan_id === $selected_plan );
+
+                // 1.14.72: pull seat config directly from package row.
+                // Enterprise / custom packages return null — those keep
+                // the simple "contact us" flow (no seat selector).
+                $plan_pkg          = CMMS_Plans::get_package( $plan_id, $selected_cycle );
+                $plan_included     = $plan_pkg ? $plan_pkg['included_seats']           : null;
+                $plan_seat_price   = $plan_pkg ? $plan_pkg['seat_addon_price']         : null;
+                $plan_hard_limit   = $plan_pkg ? $plan_pkg['hard_user_limit']          : null;
+                $plan_recommend_at = $plan_pkg ? $plan_pkg['upgrade_recommended_at']   : null;
+                $plan_base_price   = $plan_pkg ? (float) $plan_pkg['price']            : (float) $plan['price_monthly'];
+                $supports_seats    = ( $plan_included !== null && $plan_seat_price !== null );
+
+                // Default user count for THIS card: included for the plan
+                // (so each card shows its included default until adjusted).
+                $card_users = $plan_included !== null ? $plan_included : 1;
+
+                // For the URL link of the CTA — if user already chose a
+                // value for this plan (e.g. came back from step 2), reflect
+                // it here so the link respects it.
+                if ( $plan_id === $selected_plan && $supports_seats ) {
+                    $card_users = $selected_users;
+                }
+
                 $next_url = add_query_arg( array(
                     'step'  => 2,
                     'plan'  => $plan_id,
                     'cycle' => $selected_cycle,
+                    'users' => $card_users,
                 ), home_url( '/start/' ) );
             ?>
                 <article class="cmms-onb-plan <?php echo $is_recommended ? 'is-recommended' : ''; ?> <?php echo $is_selected ? 'is-selected' : ''; ?> <?php echo $selected_cycle === 'yearly' ? 'is-cycle-yearly' : ''; ?>"
-                         data-plan="<?php echo esc_attr( $plan_id ); ?>">
+                         data-plan="<?php echo esc_attr( $plan_id ); ?>"
+                         data-included="<?php echo esc_attr( $plan_included !== null ? $plan_included : '' ); ?>"
+                         data-seat-price="<?php echo esc_attr( $plan_seat_price !== null ? $plan_seat_price : '' ); ?>"
+                         data-hard-limit="<?php echo esc_attr( $plan_hard_limit !== null ? $plan_hard_limit : '' ); ?>"
+                         data-recommend-at="<?php echo esc_attr( $plan_recommend_at !== null ? $plan_recommend_at : '' ); ?>"
+                         data-base-monthly="<?php echo esc_attr( $plan['price_monthly'] ); ?>"
+                         data-base-yearly="<?php echo esc_attr( $plan['price_yearly'] ); ?>">
                     <?php if ( $is_recommended ) : ?>
                         <div class="cmms-onb-plan-badge">המומלץ</div>
                     <?php endif; ?>
@@ -1504,7 +1664,9 @@ body > footer,
                         <p class="cmms-onb-plan-tagline"><?php echo esc_html( $plan['tagline'] ); ?></p>
                     </div>
 
-                    <!-- Price block: two prices, only one visible at a time per cycle -->
+                    <!-- Price block: two prices, only one visible at a time per cycle.
+                         1.14.72: the .cmms-onb-price-amount is now data-driven so
+                         the live calculator can update it as the user adjusts seats. -->
                     <div class="cmms-onb-plan-price">
                         <?php if ( $plan['custom_price'] ) : ?>
                             <div class="cmms-onb-price-line" data-price-for="monthly">
@@ -1519,16 +1681,51 @@ body > footer,
                             </div>
                         <?php else : ?>
                             <div class="cmms-onb-price-line" data-price-for="monthly">
-                                <span class="cmms-onb-price-amount">₪<?php echo number_format( $plan['price_monthly'] ); ?></span>
+                                <span class="cmms-onb-price-amount" data-base-amount="<?php echo esc_attr( $plan['price_monthly'] ); ?>">₪<?php echo number_format( $plan['price_monthly'] ); ?></span>
                                 <span class="cmms-onb-price-suffix">/ חודש</span>
                             </div>
                             <div class="cmms-onb-price-line" data-price-for="yearly">
-                                <span class="cmms-onb-price-amount">₪<?php echo number_format( $plan['price_yearly'] ); ?></span>
+                                <span class="cmms-onb-price-amount" data-base-amount="<?php echo esc_attr( $plan['price_yearly'] ); ?>">₪<?php echo number_format( $plan['price_yearly'] ); ?></span>
                                 <span class="cmms-onb-price-suffix">/ שנה</span>
-                                <div class="cmms-onb-price-per-month">≈ ₪<?php echo number_format( CMMS_Plans::yearly_per_month( $plan_id ) ); ?> לחודש</div>
+                                <div class="cmms-onb-price-per-month">≈ ₪<span data-permonth><?php echo number_format( CMMS_Plans::yearly_per_month( $plan_id ) ); ?></span> לחודש</div>
                             </div>
                         <?php endif; ?>
                     </div>
+
+                    <?php // ────────────────────────────────────────
+                          // 1.14.72 — Seat selector for managed plans
+                          //
+                          // Custom-priced plans (Enterprise) don't get
+                          // the selector — they fall through to "contact us".
+                          // ────────────────────────────────────────
+                          if ( $supports_seats && ! $plan['custom_price'] ) : ?>
+                    <div class="cmms-onb-seats">
+                        <label class="cmms-onb-seats-label" for="seats-<?php echo esc_attr( $plan_id ); ?>">מספר משתמשים</label>
+                        <div class="cmms-onb-seats-control">
+                            <button type="button" class="cmms-onb-seats-btn" data-seats-action="dec" aria-label="הפחת">−</button>
+                            <input type="number"
+                                   class="cmms-onb-seats-input"
+                                   id="seats-<?php echo esc_attr( $plan_id ); ?>"
+                                   data-seats-input
+                                   min="<?php echo (int) $plan_included; ?>"
+                                   max="<?php echo $plan_hard_limit !== null ? (int) $plan_hard_limit : ''; ?>"
+                                   value="<?php echo (int) $card_users; ?>"
+                                   inputmode="numeric">
+                            <button type="button" class="cmms-onb-seats-btn" data-seats-action="inc" aria-label="הוסף">+</button>
+                        </div>
+                        <div class="cmms-onb-seats-hint">
+                            <span class="cmms-onb-seats-included-hint">
+                                כולל <?php echo (int) $plan_included; ?> משתמשים. כל משתמש נוסף — ₪<?php echo number_format( (float) $plan_seat_price, 0 ); ?> <?php echo $selected_cycle === 'yearly' ? '/ שנה' : '/ חודש'; ?>
+                            </span>
+                        </div>
+                        <div class="cmms-onb-seats-recommendation" data-seats-recommendation hidden>
+                            <span data-seats-rec-text></span>
+                        </div>
+                        <div class="cmms-onb-seats-warning" data-seats-warning hidden>
+                            <span data-seats-warn-text></span>
+                        </div>
+                    </div>
+                    <?php endif; ?>
 
                     <ul class="cmms-onb-plan-features">
                         <?php foreach ( $plan['features'] as $feature ) : ?>
@@ -1563,18 +1760,28 @@ body > footer,
 
         <!-- 1.14.27: chosen-plan summary card. Shows the selected plan
              above the form so the user remembers what they're signing up
-             for and has a clear way to change their mind. -->
+             for and has a clear way to change their mind.
+             1.14.72: now shows the total price with seats and the seat
+             breakdown — so user clearly sees the price they'll pay. -->
         <?php if ( $current_plan ) :
             $cycle_label = $selected_cycle === 'yearly' ? 'שנתי' : 'חודשי';
+
+            // 1.14.72: compute total price including extra seats.
+            $summary_total = CMMS_Plans::calculate_total_price( $selected_plan, $selected_cycle, $selected_users );
+            $summary_included = CMMS_Plans::included_seats( $selected_plan, $selected_cycle );
+            $extra_seats = ( $summary_included !== null ) ? max( 0, $selected_users - $summary_included ) : 0;
+
             $price_display = $current_plan['custom_price']
                 ? 'מחיר מותאם'
                 : ( $selected_cycle === 'yearly'
-                    ? '₪' . number_format( $current_plan['price_yearly'] ) . ' / שנה'
-                    : '₪' . number_format( $current_plan['price_monthly'] ) . ' / חודש' );
+                    ? '₪' . number_format( $summary_total ) . ' / שנה'
+                    : '₪' . number_format( $summary_total ) . ' / חודש' );
+
             $change_url = add_query_arg( array(
                 'step'  => 1,
                 'plan'  => $selected_plan,
                 'cycle' => $selected_cycle,
+                'users' => $selected_users,
             ), home_url( '/start/' ) );
         ?>
         <div class="cmms-onb-plan-summary">
@@ -1582,6 +1789,14 @@ body > footer,
                 <span class="cmms-onb-plan-summary-name"><?php echo esc_html( $current_plan['name'] ); ?></span>
                 <span class="cmms-onb-plan-summary-sep">·</span>
                 <span class="cmms-onb-plan-summary-cycle"><?php echo esc_html( $cycle_label ); ?></span>
+                <?php if ( $summary_included !== null ) : ?>
+                <span class="cmms-onb-plan-summary-sep">·</span>
+                <span class="cmms-onb-plan-summary-users">
+                    <?php echo (int) $selected_users; ?> משתמשים<?php if ( $extra_seats > 0 ) : ?>
+                        <span style="color:#94a3b8;font-size:12px;">(<?php echo (int) $summary_included; ?> כלולים + <?php echo (int) $extra_seats; ?> נוספים)</span>
+                    <?php endif; ?>
+                </span>
+                <?php endif; ?>
                 <span class="cmms-onb-plan-summary-sep">·</span>
                 <span class="cmms-onb-plan-summary-price"><?php echo esc_html( $price_display ); ?></span>
             </div>
@@ -1602,6 +1817,11 @@ body > footer,
                      successful signup. -->
                 <input type="hidden" name="plan" id="onb-plan" value="<?php echo esc_attr( $selected_plan ); ?>">
                 <input type="hidden" name="cycle" id="onb-cycle" value="<?php echo esc_attr( $selected_cycle ); ?>">
+
+                <!-- 1.14.72: chosen user count (seats). Carries the seat
+                     selector value from step 1. AJAX step1 saves it into
+                     the subscription as seats_purchased = max(0, users - included). -->
+                <input type="hidden" name="users" id="onb-users" value="<?php echo esc_attr( $selected_users ); ?>">
 
                 <!-- Company name -->
                 <div class="cmms-onb-field" data-field="company">
@@ -1768,7 +1988,23 @@ body > footer,
             <?php else : ?>
                 <!-- Standard payment flow: summary card + button that
                      calls cmms_payment_init via AJAX. On success the
-                     browser is redirected to the iCredit hosted page. -->
+                     browser is redirected to the iCredit hosted page.
+
+                     1.14.72: shows the seat breakdown if applicable.
+                     IMPORTANT: the amount sent to iCredit is still
+                     the base price — Phase 2b will wire dynamic amount.
+                     For now, Super Admin handles the extra seats manually
+                     after payment. -->
+                <?php
+                // 1.14.72 — compute display values for the summary card.
+                $pkg_included    = isset( $payment_package['included_seats'] )   ? $payment_package['included_seats']   : null;
+                $pkg_seat_price  = isset( $payment_package['seat_addon_price'] ) ? $payment_package['seat_addon_price'] : null;
+                $payment_supports_seats = ( $pkg_included !== null && $pkg_seat_price !== null );
+                $payment_extra_seats    = $payment_supports_seats ? max( 0, $selected_users - $pkg_included ) : 0;
+                $payment_base_price     = (float) $payment_package['price'];
+                $payment_extras_amount  = $payment_extra_seats * (float) ( $pkg_seat_price ?: 0 );
+                $payment_total_display  = $payment_base_price + $payment_extras_amount;
+                ?>
                 <div class="cmms-onb-payment-summary">
                     <div class="cmms-onb-payment-summary-line">
                         <span>חבילה</span>
@@ -1778,15 +2014,41 @@ body > footer,
                         <span>מחזור חיוב</span>
                         <strong><?php echo esc_html( $cycle_label ); ?></strong>
                     </div>
-                    <?php if ( ! empty( $payment_package['max_users'] ) ) : ?>
+                    <?php if ( $payment_supports_seats ) : ?>
+                    <div class="cmms-onb-payment-summary-line">
+                        <span>משתמשים</span>
+                        <strong>
+                            <?php echo (int) $selected_users; ?>
+                            <?php if ( $payment_extra_seats > 0 ) : ?>
+                                <span style="font-weight:normal;color:#64748b;font-size:13px;">
+                                    (<?php echo (int) $pkg_included; ?> כלולים + <?php echo (int) $payment_extra_seats; ?> נוספים)
+                                </span>
+                            <?php endif; ?>
+                        </strong>
+                    </div>
+                    <?php elseif ( ! empty( $payment_package['max_users'] ) ) : ?>
                     <div class="cmms-onb-payment-summary-line">
                         <span>משתמשים בחבילה</span>
                         <strong>עד <?php echo (int) $payment_package['max_users']; ?></strong>
                     </div>
                     <?php endif; ?>
+
+                    <?php if ( $payment_extra_seats > 0 ) : ?>
+                    <div class="cmms-onb-payment-summary-line">
+                        <span>תוספת משתמשים</span>
+                        <strong>₪<?php echo number_format( $payment_extras_amount ); ?></strong>
+                    </div>
+                    <div class="cmms-onb-payment-summary-line">
+                        <span style="color:#64748b;font-size:13px;">חבילת בסיס</span>
+                        <strong style="color:#64748b;font-size:13px;">₪<?php echo number_format( $payment_base_price ); ?></strong>
+                    </div>
+                    <?php endif; ?>
+
                     <div class="cmms-onb-payment-summary-line cmms-onb-payment-summary-total">
                         <span>סכום לתשלום</span>
-                        <strong><?php echo esc_html( $price_display ); ?></strong>
+                        <strong><?php echo '₪' . number_format( $payment_total_display ); ?></strong>
+                    </div>
+                </div>
                     </div>
                 </div>
 
@@ -1794,6 +2056,11 @@ body > footer,
                     <input type="hidden" name="cmms_payment_nonce" value="<?php echo esc_attr( $payment_nonce ); ?>">
                     <input type="hidden" name="plan" value="<?php echo esc_attr( $selected_plan ); ?>">
                     <input type="hidden" name="cycle" value="<?php echo esc_attr( $selected_cycle ); ?>">
+                    <!-- 1.14.73: pass the chosen seat count so iCredit
+                         gets billed for base + extras. The hidden field
+                         is populated from $selected_users which was
+                         clamped from URL/sessionStorage at page load. -->
+                    <input type="hidden" name="users" value="<?php echo esc_attr( $selected_users ); ?>">
 
                     <div class="cmms-onb-banner" id="cmms-onb-payment-banner" role="alert" style="display:none;"></div>
 
@@ -1965,6 +2232,10 @@ body > footer,
         // server can persist them onto the new account row.
         body.set('plan',  data.get('plan')  || '');
         body.set('cycle', data.get('cycle') || '');
+        // 1.14.72: carry the chosen user count (seats). Without this,
+        // the server would default to the package's included_seats and
+        // ignore the user's seat selection from step 1.
+        body.set('users', data.get('users') || '');
 
         fetch(adminPost, {
             method: 'POST',
@@ -2001,7 +2272,7 @@ body > footer,
 })();
 
 /* ============================================================
-   Pricing step JS (1.14.27)
+   Pricing step JS (1.14.27 → 1.14.72)
    Only attaches when we're on step 1 (Pricing). Handles:
      - Billing cycle toggle (monthly / yearly) — switches visible prices
        in every plan card without a server round-trip.
@@ -2011,6 +2282,18 @@ body > footer,
        carry it.
      - Updating the CTAs so clicking "Continue with X" lands on
        step 2 with the right ?cycle= URL param.
+
+   1.14.72 additions:
+     - Seat selector per managed plan card. Live price calculation
+       based on (included_seats, seat_addon_price) attached to the
+       card via data- attributes. Soft recommendation (upgrade_recommended_at)
+       and hard ceiling (hard_user_limit) warnings.
+     - CTA href carries ?users=N so step 2 / step 3 know the count.
+     - sessionStorage stores users per plan, so users see their previous
+       choice when they come back from step 2.
+
+   No iCredit changes here — Phase 2b will handle dynamic amount
+   submission to iCredit. For now, the displayed price is informational.
    ============================================================ */
 (function () {
     'use strict';
@@ -2022,6 +2305,8 @@ body > footer,
 
     var cycleButtons = document.querySelectorAll('.cmms-onb-cycle-btn');
     var planCTAs = document.querySelectorAll('[data-plan-cta]');
+    var planCards = document.querySelectorAll('.cmms-onb-plan');
+    var priceLines = document.querySelectorAll('.cmms-onb-price-line');
 
     function loadState() {
         try {
@@ -2044,11 +2329,127 @@ body > footer,
         return 'monthly';
     }
 
-    var planCards = document.querySelectorAll('.cmms-onb-plan');
-    // Also grab every individual price line — we'll force its inline
-    // display style as a final override. This is belt-and-braces in case
-    // a theme's CSS uses higher specificity than ours and wins.
-    var priceLines = document.querySelectorAll('.cmms-onb-price-line');
+    /* ────────────────────────────────────────────────────────────
+       1.14.72 — Seat selector logic per card
+       ──────────────────────────────────────────────────────────── */
+
+    // Read seat config from card data- attributes (set server-side from
+    // the package row). Missing values mean "unmanaged" (Enterprise).
+    function cardConfig(card) {
+        var inc  = parseInt(card.getAttribute('data-included'),     10);
+        var sp   = parseFloat(card.getAttribute('data-seat-price'));
+        var hard = parseInt(card.getAttribute('data-hard-limit'),   10);
+        var rec  = parseInt(card.getAttribute('data-recommend-at'), 10);
+        return {
+            included:    isNaN(inc) ? null : inc,
+            seatPrice:   isNaN(sp)  ? null : sp,
+            hardLimit:   isNaN(hard) ? null : hard,
+            recommendAt: isNaN(rec)  ? null : rec,
+            baseMonthly: parseFloat(card.getAttribute('data-base-monthly')) || 0,
+            baseYearly:  parseFloat(card.getAttribute('data-base-yearly'))  || 0,
+            planId:      card.getAttribute('data-plan')
+        };
+    }
+
+    // Clamp the input value to [included, hard_limit] (or [1, ∞] if no caps).
+    function clampSeats(card, raw) {
+        var c = cardConfig(card);
+        var v = parseInt(raw, 10);
+        if (isNaN(v) || v < 1) v = c.included !== null ? c.included : 1;
+        if (c.included !== null && v < c.included) v = c.included;
+        if (c.hardLimit !== null && v > c.hardLimit) v = c.hardLimit;
+        return v;
+    }
+
+    // Hebrew number formatter (no fractions).
+    function fmtPrice(n) {
+        try {
+            return '₪' + Math.round(n).toLocaleString('he-IL');
+        } catch (e) {
+            return '₪' + Math.round(n);
+        }
+    }
+
+    // Update visible price, ≈ per-month line, recommendation, and warning.
+    function updateCardDisplay(card) {
+        var c = cardConfig(card);
+        var input = card.querySelector('[data-seats-input]');
+        if (!input) return; // unmanaged card — skip
+
+        var users = clampSeats(card, input.value);
+        if (String(users) !== input.value) input.value = users;
+
+        var cycle = getActiveCycle();
+        var base  = (cycle === 'yearly') ? c.baseYearly : c.baseMonthly;
+        var extras = c.included !== null ? Math.max(0, users - c.included) : 0;
+        var total  = base + (extras * (c.seatPrice || 0));
+
+        // Update price amounts (both monthly and yearly lines on this card).
+        card.querySelectorAll('[data-base-amount]').forEach(function (el) {
+            // Decide which cycle this element represents.
+            var line = el.closest('.cmms-onb-price-line');
+            var lineCycle = line ? line.getAttribute('data-price-for') : 'monthly';
+            var lineBase  = (lineCycle === 'yearly') ? c.baseYearly : c.baseMonthly;
+            var lineTotal = lineBase + (extras * (c.seatPrice || 0));
+            el.textContent = fmtPrice(lineTotal);
+        });
+        // Update ≈ /month line on the yearly card.
+        var permonth = card.querySelector('[data-permonth]');
+        if (permonth && c.baseYearly > 0) {
+            var yearlyTotal = c.baseYearly + (extras * (c.seatPrice || 0));
+            permonth.textContent = Math.round(yearlyTotal / 12).toLocaleString('he-IL');
+        }
+
+        // Update −/+ button disabled state.
+        var dec = card.querySelector('[data-seats-action="dec"]');
+        var inc = card.querySelector('[data-seats-action="inc"]');
+        if (dec) dec.disabled = ( c.included !== null && users <= c.included );
+        if (inc) inc.disabled = ( c.hardLimit !== null && users >= c.hardLimit );
+
+        // Recommendation: show when user count >= (recommendAt% of hardLimit).
+        var recEl  = card.querySelector('[data-seats-recommendation]');
+        var recTxt = card.querySelector('[data-seats-rec-text]');
+        if (recEl && recTxt && c.hardLimit !== null && c.recommendAt) {
+            var threshold = Math.ceil(c.hardLimit * (c.recommendAt / 100));
+            if (users >= threshold && users < c.hardLimit) {
+                var nextLabel = (c.planId === 'starter') ? 'Business' : 'Enterprise';
+                recTxt.textContent = '💡 בכמות כזו של משתמשים מומלץ לעבור לחבילת ' + nextLabel + ' — חסכון משמעותי.';
+                recEl.hidden = false;
+            } else {
+                recEl.hidden = true;
+            }
+        }
+
+        // Hard-limit warning: show when at the ceiling.
+        var warnEl  = card.querySelector('[data-seats-warning]');
+        var warnTxt = card.querySelector('[data-seats-warn-text]');
+        if (warnEl && warnTxt && c.hardLimit !== null) {
+            if (users >= c.hardLimit) {
+                warnTxt.textContent = '⚠ הגעת לגג המשתמשים של חבילה זו. למספרים גבוהים יותר נדרשת חבילה גדולה יותר.';
+                warnEl.hidden = false;
+            } else {
+                warnEl.hidden = true;
+            }
+        }
+
+        // Update CTA href with chosen users.
+        var cta = card.querySelector('[data-plan-cta]');
+        if (cta) {
+            try {
+                var href = cta.getAttribute('href');
+                var url  = new URL(href, window.location.origin);
+                url.searchParams.set('users', users);
+                url.searchParams.set('cycle', cycle);
+                cta.setAttribute('href', url.toString());
+            } catch (e) {}
+        }
+
+        // Persist per-plan seats so user keeps their choice on back/forward.
+        var st = loadState();
+        if (!st.users) st.users = {};
+        st.users[c.planId] = users;
+        saveState({ users: st.users });
+    }
 
     function applyCycle(cycle) {
         // Update toggle button state
@@ -2084,6 +2485,12 @@ body > footer,
             } catch (e) {}
         });
         saveState({ cycle: cycle });
+
+        // 1.14.72: after cycle switch, recompute every managed card's
+        // dynamic price for the new cycle.
+        planCards.forEach(function (card) {
+            if (card.querySelector('[data-seats-input]')) updateCardDisplay(card);
+        });
     }
 
     // Initial sync. If URL has no cycle but sessionStorage does, use it.
@@ -2105,29 +2512,79 @@ body > footer,
         btn.addEventListener('click', function (e) {
             e.preventDefault();
             var cycle = btn.getAttribute('data-cycle');
-            try { console.log('[CMMS] Cycle toggled to:', cycle, '— price lines updated:', priceLines.length); } catch (_) {}
             applyCycle(cycle);
         });
     });
 
+    // 1.14.72 — wire up seat selectors per card.
+    planCards.forEach(function (card) {
+        var input = card.querySelector('[data-seats-input]');
+        if (!input) return; // unmanaged card
+
+        // Restore previous user-chosen value from sessionStorage if available.
+        try {
+            var s = loadState();
+            if (s.users && s.users[card.getAttribute('data-plan')]) {
+                input.value = s.users[card.getAttribute('data-plan')];
+            }
+        } catch (e) {}
+
+        // -/+ buttons
+        card.querySelectorAll('[data-seats-action]').forEach(function (btn) {
+            btn.addEventListener('click', function (e) {
+                e.preventDefault();
+                var action = btn.getAttribute('data-seats-action');
+                var current = parseInt(input.value, 10) || 0;
+                input.value = (action === 'inc') ? (current + 1) : (current - 1);
+                updateCardDisplay(card);
+            });
+        });
+
+        // Direct input changes
+        input.addEventListener('input', function () { updateCardDisplay(card); });
+        input.addEventListener('change', function () { updateCardDisplay(card); });
+
+        // Initial render to apply clamp + price.
+        updateCardDisplay(card);
+    });
+
     // Save chosen plan when user clicks a CTA — backup for step 2 in
-    // case URL params get lost.
+    // case URL params get lost. 1.14.72: also save the seat count.
     planCTAs.forEach(function (cta) {
         cta.addEventListener('click', function () {
-            saveState({
+            var card = cta.closest('.cmms-onb-plan');
+            var input = card ? card.querySelector('[data-seats-input]') : null;
+            var users = input ? parseInt(input.value, 10) : 0;
+
+            var patch = {
                 plan:  cta.getAttribute('data-plan-cta'),
                 cycle: getActiveCycle(),
-            });
+            };
+            if (users > 0) {
+                var st = loadState();
+                st.users = st.users || {};
+                st.users[patch.plan] = users;
+                patch.users = st.users;
+                patch.lastUsers = users;
+            }
+            saveState(patch);
         });
     });
 })();
 
 /* ============================================================
-   Step 2 hydration from sessionStorage (1.14.27)
+   Step 2 hydration from sessionStorage (1.14.27 → 1.14.72)
    If the user lands on step 2 without plan/cycle in URL but has them
    in sessionStorage, refresh the URL silently so all server-rendered
    summary/CTAs reflect the correct state. This handles the case where
    someone bookmarks /start?step=2 or copies a URL without the params.
+
+   1.14.72 additions:
+     - If URL has plan+cycle but is missing 'users', AND sessionStorage
+       has a saved user count for that plan, reload with the right
+       'users' so the summary card and hidden field are correct.
+     - Also keep the #onb-users hidden field synced with what we know,
+       as a final safety net for AJAX submission.
    ============================================================ */
 (function () {
     'use strict';
@@ -2141,6 +2598,21 @@ body > footer,
         var st = JSON.parse(sessionStorage.getItem('cmms_onb_state') || '{}');
         var hasUrlPlan  = urlParams.get('plan');
         var hasUrlCycle = urlParams.get('cycle');
+        var hasUrlUsers = urlParams.get('users');
+
+        // 1.14.72: if URL is missing 'users' but we have a recorded
+        // selection in sessionStorage for the current plan, reload
+        // once with the correct value. The same hydration guard
+        // prevents loops.
+        if (hasUrlPlan && !hasUrlUsers && st.users && st.users[hasUrlPlan]) {
+            if (!sessionStorage.getItem('cmms_onb_hydrated_users')) {
+                sessionStorage.setItem('cmms_onb_hydrated_users', '1');
+                urlParams.set('users', String(st.users[hasUrlPlan]));
+                window.location.replace(window.location.pathname + '?' + urlParams.toString());
+                return;
+            }
+        }
+
         if (!hasUrlPlan && st.plan) {
             // Reload with the proper params so server-side rendering
             // shows the right summary card. One-shot guarded by sessionStorage
@@ -2149,13 +2621,29 @@ body > footer,
                 sessionStorage.setItem('cmms_onb_hydrated', '1');
                 urlParams.set('plan', st.plan);
                 if (st.cycle) urlParams.set('cycle', st.cycle);
+                // 1.14.72: also carry users if available.
+                if (st.users && st.users[st.plan]) urlParams.set('users', String(st.users[st.plan]));
                 window.location.replace(window.location.pathname + '?' + urlParams.toString());
                 return;
             }
         }
+
         // Got here — either URL has params or no useful sessionStorage.
-        // Clear the hydration guard for future visits.
+        // Clear the hydration guards for future visits.
         sessionStorage.removeItem('cmms_onb_hydrated');
+        sessionStorage.removeItem('cmms_onb_hydrated_users');
+
+        // 1.14.72: belt-and-braces — make sure the #onb-users hidden
+        // field reflects the URL or sessionStorage value. The server
+        // already set it from $selected_users, but if we just reloaded
+        // with the corrected param, this catches any race.
+        var hiddenUsers = document.getElementById('onb-users');
+        if (hiddenUsers && hasUrlPlan) {
+            var resolvedUsers = urlParams.get('users')
+                || (st.users && st.users[hasUrlPlan])
+                || hiddenUsers.value;
+            if (resolvedUsers) hiddenUsers.value = String(resolvedUsers);
+        }
     } catch (e) {}
 })();
 
@@ -2199,6 +2687,9 @@ body > footer,
         body.set('cmms_payment_nonce', data.get('cmms_payment_nonce'));
         body.set('plan',  data.get('plan'));
         body.set('cycle', data.get('cycle'));
+        // 1.14.73: carry the chosen seat count so iCredit gets the
+        // correct total amount (base + extras × seat price).
+        body.set('users', data.get('users') || '');
 
         fetch(adminPost, {
             method: 'POST',
@@ -3112,10 +3603,20 @@ body {
         if ( $sub_status === 'frozen' ) {
             return $this->render_frozen_blocker();
         }
+        // 1.14.81.3: Demo accounts skip the payment gate entirely.
+        // These accounts are seeded by CMMS_Demo::create() for prospect
+        // demos — they never go through onboarding/payment, so they'd
+        // otherwise be blocked here. We treat 'demo' as a fully active
+        // first-class status. To convert a demo to a real subscription,
+        // simply update the column to 'active' (and add a real
+        // subscription row).
+        if ( $sub_status === 'demo' ) {
+            // fall through to normal dashboard rendering — no gate
+        }
         // 1.14.56: canceled_pending = user clicked Cancel. Allow access
         // until next_charge_at has passed, then revoke. Check via
         // the subscriptions table.
-        if ( $sub_status === 'canceled_pending' ) {
+        elseif ( $sub_status === 'canceled_pending' ) {
             global $wpdb;
             $subs_t = CMMS_DB::table( 'subscriptions' );
             $period_end = $wpdb->get_var( $wpdb->prepare(
@@ -3161,12 +3662,25 @@ body {
         $nav_items_work = array(
             array( 'view' => 'home',     'icon' => 'home',  'label' => 'nav.home' ),
             array( 'view' => 'tasks',    'icon' => 'list',  'label' => 'nav.tasks' ),
+            // 1.14.81.1: Calendar item — points to the tasks page in
+            // calendar display mode. Uses 'extra' so the URL becomes
+            // ?view=tasks&display=calendar instead of view=calendar
+            // (which would 404). The 'highlight' key tells the nav
+            // renderer when to mark this item active (when both
+            // view=tasks AND display=calendar are present).
+            array( 'view' => 'tasks',    'icon' => 'calendar', 'label' => 'nav.calendar',
+                   'extra' => array( 'display' => 'calendar' ),
+                   'highlight' => 'calendar' ),
             array( 'view' => 'task_new', 'icon' => 'plus-circle', 'label' => 'nav.new_task' ),
             array( 'view' => 'assets',   'icon' => 'package', 'label' => 'nav.assets' ),
         );
         $nav_items_manage = array(
             array( 'view' => 'reports',    'icon' => 'bar-chart', 'label' => 'nav.reports' ),
             array( 'view' => 'forms',      'icon' => 'clipboard', 'label' => 'nav.forms' ),
+            // 1.15.5: Email-to-task inbound log. Sits next to Forms
+            // since each form has its own inbound address. Shows all
+            // incoming emails across the account in one place.
+            array( 'view' => 'email_log',  'icon' => 'mail',      'label' => 'nav.email_log' ),
             array( 'view' => 'users',      'icon' => 'users',     'label' => 'nav.users' ),
             array( 'view' => 'import',     'icon' => 'upload',    'label' => 'nav.import_assets' ),
             array( 'view' => 'bulk_tasks', 'icon' => 'plus-square','label' => 'nav.bulk_tasks' ),
@@ -3178,7 +3692,7 @@ body {
         global $wpdb;
         $t_tasks = CMMS_DB::table( 'tasks' );
         $open_count = (int) $wpdb->get_var( $wpdb->prepare(
-            "SELECT COUNT(*) FROM $t_tasks WHERE account_id = %d AND status IN ('open','in_progress','waiting')",
+            "SELECT COUNT(*) FROM $t_tasks WHERE account_id = %d AND status IN ('open','in_progress','waiting') AND deleted_at IS NULL",
             $u->account_id
         ) );
         // Notification bell data
@@ -3256,12 +3770,37 @@ body {
 
                 <nav class="cmms-sidebar-nav">
                     <div class="cmms-sidebar-section-label"><?php $this->e( 'nav.section.work' ); ?></div>
-                    <?php foreach ( $nav_items_work as $item ) : ?>
-                        <a href="<?php echo esc_url( $this->url( array( 'view' => $item['view'] ) ) ); ?>"
-                           class="<?php echo $view === $item['view'] ? 'active' : ''; ?>">
+                    <?php
+                    // 1.14.81.1: Active-state for sidebar items is now
+                    // computed per-item. Two items can share view='tasks'
+                    // (Tasks and Calendar) and we differentiate using
+                    // the URL's `display` param.
+                    $current_display = isset( $_GET['display'] ) ? sanitize_key( wp_unslash( $_GET['display'] ) ) : '';
+                    foreach ( $nav_items_work as $item ) :
+                        $item_args = array( 'view' => $item['view'] );
+                        if ( ! empty( $item['extra'] ) && is_array( $item['extra'] ) ) {
+                            $item_args = array_merge( $item_args, $item['extra'] );
+                        }
+                        // Active state:
+                        //   - For items with 'highlight', active when
+                        //     view matches AND display matches highlight.
+                        //   - For plain tasks item, active when view=tasks
+                        //     AND display is NOT 'calendar' (otherwise it
+                        //     would highlight both tasks and calendar).
+                        //   - For all other items, just match view.
+                        if ( ! empty( $item['highlight'] ) ) {
+                            $is_active = ( $view === $item['view'] && $current_display === $item['highlight'] );
+                        } else if ( $item['view'] === 'tasks' ) {
+                            $is_active = ( $view === 'tasks' && $current_display !== 'calendar' );
+                        } else {
+                            $is_active = ( $view === $item['view'] );
+                        }
+                    ?>
+                        <a href="<?php echo esc_url( $this->url( $item_args ) ); ?>"
+                           class="<?php echo $is_active ? 'active' : ''; ?>">
                             <?php CMMS_Icons::e( $item['icon'], 18 ); ?>
                             <span><?php $this->e( $item['label'] ); ?></span>
-                            <?php if ( $item['view'] === 'tasks' && $open_count > 0 ) : ?>
+                            <?php if ( $item['view'] === 'tasks' && empty( $item['extra'] ) && $open_count > 0 ) : ?>
                                 <span class="cmms-sidebar-nav-badge"><?php echo esc_html( $open_count ); ?></span>
                             <?php endif; ?>
                         </a>
@@ -3381,6 +3920,7 @@ body {
                     case 'reports':   $this->view_reports( $u ); break;
                     case 'forms':     $this->view_forms( $u ); break;
                     case 'form_edit': $this->view_form_edit( $u ); break;
+                    case 'email_log': $this->view_email_log( $u ); break;
                     case 'users':     $this->view_users( $u ); break;
                     case 'import':    $this->view_import( $u ); break;
                     case 'bulk_tasks': $this->view_bulk_tasks( $u ); break;
@@ -3392,37 +3932,493 @@ body {
             </main>
         </div>
 
-        <?php // === HELP CENTER (1.14.22) ===
-              // Floating help trigger and modal shell. The trigger looks at
-              // the nearest [data-cmms-page] ancestor (set by each view) and
-              // asks the server for that page's articles. If the user is
-              // already on the help center page, the trigger hides itself —
-              // there's no sensible "help on a help page". ?>
+        <?php
+        // 1.14.88: Floating Help Assistant ("יועץ") — chatbot-style
+        // help widget. Replaces the old simple per-page help (1.14.22).
+        // The widget shows the user a menu of FAQ categories →
+        // questions → step-by-step answers with "take me there" links.
+        // All content from CMMS_Help_Center::topics().
+        //
+        // Permission-aware: if a topic is for a role the user doesn't
+        // have, the "take me there" button becomes a polite "this
+        // action requires X permission" message instead of navigating.
+        $help_topics      = CMMS_Help_Center::topics();
+        $help_categories  = CMMS_Help_Center::categories();
+        $help_user_role   = $u->role;
+        ?>
         <button type="button"
-                class="cmms-help-fab"
-                data-cmms-help-trigger
-                aria-label="עזרה לעמוד זה">
-            <span aria-hidden="true">?</span>
+                class="cmms-assistant-fab"
+                data-cmms-assistant-trigger
+                aria-label="יועץ העזרה"
+                title="פתח יועץ העזרה">
+            <span aria-hidden="true">💬</span>
         </button>
 
-        <div class="cmms-help-modal" data-cmms-help-modal hidden role="dialog" aria-modal="true" aria-labelledby="cmms-help-modal-title">
-            <div class="cmms-help-modal-backdrop" data-cmms-help-close></div>
-            <div class="cmms-help-modal-card" role="document">
-                <header class="cmms-help-modal-head">
-                    <h2 id="cmms-help-modal-title">עזרה</h2>
-                    <button type="button" class="cmms-help-modal-close" data-cmms-help-close aria-label="סגור">×</button>
-                </header>
-                <div class="cmms-help-modal-body" data-cmms-help-modal-body>
-                    <p>טוען&hellip;</p>
+        <div class="cmms-assistant-panel" data-cmms-assistant-panel hidden role="dialog" aria-modal="false" aria-labelledby="cmms-assistant-title">
+            <header class="cmms-assistant-head">
+                <div class="cmms-assistant-head-info">
+                    <div class="cmms-assistant-avatar">💬</div>
+                    <div class="cmms-assistant-headline">
+                        <div id="cmms-assistant-title" class="cmms-assistant-title">היועץ של CMMS</div>
+                        <div class="cmms-assistant-subtitle">מענה מיידי על שאלות נפוצות</div>
+                    </div>
                 </div>
-                <footer class="cmms-help-modal-foot">
-                    <a class="cmms-btn cmms-btn-ghost cmms-btn-sm"
-                       href="<?php echo esc_url( $this->url( array( 'view' => 'help' ) ) ); ?>">
-                        כל המאמרים במרכז ההדרכה
-                    </a>
-                </footer>
+                <button type="button" class="cmms-assistant-close" data-cmms-assistant-close aria-label="סגור">×</button>
+            </header>
+
+            <div class="cmms-assistant-body" data-cmms-assistant-body>
+                <!-- Conversation messages render here. Built by JS. -->
             </div>
+
+            <footer class="cmms-assistant-foot">
+                <button type="button"
+                        class="cmms-assistant-foot-btn"
+                        data-cmms-assistant-reset
+                        title="התחל מחדש">
+                    🏠 חזור לתפריט הראשי
+                </button>
+            </footer>
         </div>
+
+        <script>
+        (function () {
+            'use strict';
+            // ─── Data injected from PHP ─────────────────────────────
+            var TOPICS     = <?php echo wp_json_encode( $help_topics ); ?>;
+            var CATEGORIES = <?php echo wp_json_encode( $help_categories ); ?>;
+            var USER_ROLE  = <?php echo wp_json_encode( $help_user_role ); ?>;
+            var DASHBOARD_URL = <?php echo wp_json_encode( $this->url( array() ) ); ?>;
+
+            // ─── Elements ────────────────────────────────────────────
+            var fab    = document.querySelector('[data-cmms-assistant-trigger]');
+            var panel  = document.querySelector('[data-cmms-assistant-panel]');
+            var body   = document.querySelector('[data-cmms-assistant-body]');
+            var btnClose = document.querySelector('[data-cmms-assistant-close]');
+            var btnReset = document.querySelector('[data-cmms-assistant-reset]');
+
+            if (!fab || !panel || !body) return;
+
+            // ─── Open/close ─────────────────────────────────────────
+            function open()  { panel.hidden = false; renderMenu(); }
+            function close() { panel.hidden = true; }
+            fab.addEventListener('click', open);
+
+            // Robust close: any element marked data-cmms-assistant-close
+            // closes the panel (the X button is one such element).
+            // Using event delegation in case DOM is rebuilt.
+            panel.addEventListener('click', function (e) {
+                var t = e.target;
+                while (t && t !== panel) {
+                    if (t.hasAttribute && t.hasAttribute('data-cmms-assistant-close')) {
+                        close();
+                        return;
+                    }
+                    t = t.parentNode;
+                }
+            });
+
+            // ESC key closes the panel.
+            document.addEventListener('keydown', function (e) {
+                if (e.key === 'Escape' && !panel.hidden) close();
+            });
+
+            // Reset button.
+            if (btnReset) {
+                btnReset.addEventListener('click', renderMenu);
+            }
+
+            // ─── Helpers ────────────────────────────────────────────
+            function el(tag, cls, html) {
+                var e = document.createElement(tag);
+                if (cls) e.className = cls;
+                if (html !== undefined) e.innerHTML = html;
+                return e;
+            }
+
+            function botMessage(html) {
+                var m = el('div', 'cmms-assist-msg cmms-assist-msg-bot');
+                m.appendChild(el('div', 'cmms-assist-msg-avatar', '💬'));
+                m.appendChild(el('div', 'cmms-assist-msg-bubble', html));
+                return m;
+            }
+
+            function buttonRow(buttons) {
+                var row = el('div', 'cmms-assist-buttons');
+                buttons.forEach(function (b) {
+                    var btn = el('button', 'cmms-assist-btn', b.html);
+                    btn.type = 'button';
+                    btn.addEventListener('click', b.onClick);
+                    row.appendChild(btn);
+                });
+                return row;
+            }
+
+            function scrollToBottom() {
+                body.scrollTop = body.scrollHeight;
+            }
+
+            function userCanAccess(topic) {
+                if (!topic.required_role || !topic.required_role.length) return true;
+                return topic.required_role.indexOf(USER_ROLE) !== -1;
+            }
+
+            function roleLabel(role) {
+                var labels = { owner: 'בעלים', manager: 'מנהל', technician: 'טכנאי', reporter: 'מדווח' };
+                return labels[role] || role;
+            }
+
+            // ─── VIEW: main menu ────────────────────────────────────
+            function renderMenu() {
+                body.innerHTML = '';
+
+                body.appendChild(botMessage(
+                    '<p>שלום! 👋</p>' +
+                    '<p>אני כאן לעזור לך. בחר נושא לקבלת הסבר מהיר:</p>'
+                ));
+
+                // Build category buttons, filtering out empties
+                var catButtons = [];
+                Object.keys(CATEGORIES).forEach(function (catKey) {
+                    var cat = CATEGORIES[catKey];
+                    // Has any topics in this category?
+                    var topicsInCat = TOPICS.filter(function (t) { return t.category === catKey; });
+                    if (!topicsInCat.length) return;
+                    catButtons.push({
+                        html: cat.icon + ' ' + cat.label,
+                        onClick: function () { renderCategory(catKey); }
+                    });
+                });
+
+                body.appendChild(buttonRow(catButtons));
+                scrollToBottom();
+            }
+
+            // ─── VIEW: questions in a category ─────────────────────
+            function renderCategory(catKey) {
+                body.innerHTML = '';
+
+                var cat = CATEGORIES[catKey];
+                var topicsInCat = TOPICS.filter(function (t) { return t.category === catKey; });
+
+                body.appendChild(botMessage(
+                    '<p>' + cat.icon + ' <strong>' + cat.label + '</strong></p>' +
+                    '<p>על מה תרצה ללמוד?</p>'
+                ));
+
+                var topicButtons = topicsInCat.map(function (t) {
+                    return {
+                        html: t.icon + ' ' + t.title,
+                        onClick: function () { renderTopic(t.id); }
+                    };
+                });
+
+                topicButtons.push({
+                    html: '◀ חזור',
+                    onClick: renderMenu
+                });
+
+                body.appendChild(buttonRow(topicButtons));
+                scrollToBottom();
+            }
+
+            // ─── VIEW: a single topic with steps ──────────────────
+            function renderTopic(topicId) {
+                var topic = TOPICS.find(function (t) { return t.id === topicId; });
+                if (!topic) { renderMenu(); return; }
+
+                body.innerHTML = '';
+
+                // Build the answer HTML
+                var html = '<p><strong>' + topic.icon + ' ' + topic.title + '</strong></p>';
+                if (topic.steps && topic.steps.length) {
+                    html += '<ol class="cmms-assist-steps">';
+                    topic.steps.forEach(function (s) { html += '<li>' + s + '</li>'; });
+                    html += '</ol>';
+                }
+                if (topic.tip) {
+                    html += '<div class="cmms-assist-tip">' + topic.tip + '</div>';
+                }
+
+                body.appendChild(botMessage(html));
+
+                // Action buttons
+                var actionButtons = [];
+
+                if (topic.link) {
+                    if (userCanAccess(topic)) {
+                        actionButtons.push({
+                            html: '📍 ' + (topic.link_label || 'קח אותי לשם'),
+                            onClick: function () {
+                                // 1.14.88.2 fix: Build URL properly.
+                                // topic.link is "?view=tasks" or "?view=settings&tab=org".
+                                // We need to merge with DASHBOARD_URL (which may
+                                // already contain params we want to drop, since
+                                // we're navigating to a new page).
+                                //
+                                // Approach: use only the pathname of DASHBOARD_URL
+                                // and append topic.link as-is. Cleanest.
+                                var parts = DASHBOARD_URL.split('?');
+                                var basePath = parts[0]; // "/cmms-dashboard/"
+                                var newUrl = basePath + topic.link;
+                                window.location.href = newUrl;
+                            }
+                        });
+                    } else {
+                        actionButtons.push({
+                            html: '🔒 נדרשת הרשאה',
+                            onClick: function () {
+                                var needRole = topic.required_role.map(roleLabel).join(' / ');
+                                body.appendChild(botMessage(
+                                    '<p>⚠️ <strong>פעולה זו דורשת הרשאה</strong></p>' +
+                                    '<p>כדי לבצע את הפעולה, אתה צריך להיות: <strong>' + needRole + '</strong></p>' +
+                                    '<p>פנה לבעלים של החשבון או למנהל כדי לקבל הרשאה מתאימה.</p>'
+                                ));
+                                scrollToBottom();
+                            }
+                        });
+                    }
+                }
+
+                actionButtons.push({
+                    html: '◀ חזור',
+                    onClick: function () { renderCategory(topic.category); }
+                });
+
+                actionButtons.push({
+                    html: '🏠 תפריט ראשי',
+                    onClick: renderMenu
+                });
+
+                body.appendChild(buttonRow(actionButtons));
+                scrollToBottom();
+            }
+        })();
+        </script>
+
+        <style>
+            /* ─── Floating assistant FAB ───────────────────────── */
+            .cmms-assistant-fab {
+                position: fixed;
+                bottom: 24px;
+                inset-inline-end: 24px;
+                width: 60px;
+                height: 60px;
+                border-radius: 50%;
+                background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+                color: #fff;
+                border: none;
+                cursor: pointer;
+                box-shadow: 0 4px 14px rgba(99, 102, 241, 0.4);
+                font-size: 28px;
+                line-height: 1;
+                z-index: 9998;
+                transition: transform .2s ease, box-shadow .2s ease;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            .cmms-assistant-fab:hover {
+                transform: scale(1.08);
+                box-shadow: 0 6px 20px rgba(99, 102, 241, 0.55);
+            }
+            .cmms-assistant-fab:active { transform: scale(0.96); }
+
+            /* ─── Panel ────────────────────────────────────────── */
+            .cmms-assistant-panel[hidden] {
+                display: none !important;
+            }
+            .cmms-assistant-panel {
+                position: fixed;
+                bottom: 100px;
+                inset-inline-end: 24px;
+                width: 380px;
+                max-width: calc(100vw - 32px);
+                height: 560px;
+                max-height: calc(100vh - 140px);
+                background: #fff;
+                border-radius: 16px;
+                box-shadow: 0 20px 50px rgba(15, 23, 42, 0.25);
+                z-index: 9999;
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+                animation: cmms-assist-in .18s ease;
+            }
+            @keyframes cmms-assist-in {
+                from { opacity: 0; transform: translateY(12px); }
+                to   { opacity: 1; transform: translateY(0); }
+            }
+
+            /* ─── Head ─────────────────────────────────────────── */
+            .cmms-assistant-head {
+                background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+                color: #fff;
+                padding: 14px 16px;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+            }
+            .cmms-assistant-head-info { display: flex; align-items: center; gap: 12px; }
+            .cmms-assistant-avatar {
+                width: 40px; height: 40px;
+                background: rgba(255,255,255,0.2);
+                border-radius: 50%;
+                display: flex; align-items: center; justify-content: center;
+                font-size: 22px;
+            }
+            .cmms-assistant-title { font-weight: 700; font-size: 15px; line-height: 1.2; }
+            .cmms-assistant-subtitle { font-size: 12px; opacity: 0.9; margin-top: 2px; }
+            .cmms-assistant-close {
+                background: rgba(255,255,255,0.15);
+                color: #fff;
+                border: none;
+                width: 32px; height: 32px;
+                border-radius: 50%;
+                cursor: pointer;
+                font-size: 22px;
+                line-height: 1;
+                display: flex; align-items: center; justify-content: center;
+            }
+            .cmms-assistant-close:hover { background: rgba(255,255,255,0.28); }
+
+            /* ─── Body (chat area) ─────────────────────────────── */
+            .cmms-assistant-body {
+                flex: 1;
+                overflow-y: auto;
+                padding: 16px;
+                background: #f8fafc;
+                display: flex;
+                flex-direction: column;
+                gap: 14px;
+            }
+
+            /* ─── Messages ─────────────────────────────────────── */
+            .cmms-assist-msg {
+                display: flex;
+                gap: 8px;
+                align-items: flex-end;
+                animation: cmms-assist-msg-in .15s ease;
+            }
+            @keyframes cmms-assist-msg-in {
+                from { opacity: 0; transform: translateY(4px); }
+                to   { opacity: 1; transform: translateY(0); }
+            }
+            .cmms-assist-msg-avatar {
+                width: 28px; height: 28px;
+                background: #fff;
+                border: 1px solid #e2e8f0;
+                border-radius: 50%;
+                display: flex; align-items: center; justify-content: center;
+                font-size: 14px;
+                flex-shrink: 0;
+            }
+            .cmms-assist-msg-bubble {
+                background: #fff;
+                padding: 10px 14px;
+                border-radius: 14px 14px 14px 4px;
+                border: 1px solid #e2e8f0;
+                font-size: 14px;
+                line-height: 1.5;
+                color: #1e293b;
+                max-width: calc(100% - 40px);
+            }
+            .cmms-assist-msg-bubble p { margin: 0 0 8px 0; }
+            .cmms-assist-msg-bubble p:last-child { margin-bottom: 0; }
+            .cmms-assist-msg-bubble strong { color: #6366f1; }
+
+            .cmms-assist-steps {
+                margin: 8px 0 0 0;
+                padding-inline-start: 22px;
+                font-size: 13px;
+                line-height: 1.6;
+            }
+            .cmms-assist-steps li { margin-bottom: 6px; }
+            .cmms-assist-steps li:last-child { margin-bottom: 0; }
+
+            .cmms-assist-tip {
+                margin-top: 12px;
+                padding: 10px 12px;
+                background: #fef9c3;
+                border-radius: 8px;
+                font-size: 12.5px;
+                line-height: 1.5;
+                color: #713f12;
+                border-inline-start: 3px solid #f59e0b;
+            }
+
+            /* ─── Action buttons ──────────────────────────────── */
+            .cmms-assist-buttons {
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                margin-top: 4px;
+                padding-inline-start: 36px;
+            }
+            .cmms-assist-btn {
+                background: #fff;
+                border: 1.5px solid #e2e8f0;
+                color: #1e293b;
+                padding: 10px 14px;
+                border-radius: 10px;
+                font-size: 13.5px;
+                font-weight: 500;
+                cursor: pointer;
+                text-align: start;
+                transition: all .15s ease;
+                line-height: 1.4;
+            }
+            .cmms-assist-btn:hover {
+                background: #6366f1;
+                color: #fff;
+                border-color: #6366f1;
+                transform: translateX(-2px);
+            }
+
+            /* ─── Footer ──────────────────────────────────────── */
+            .cmms-assistant-foot {
+                padding: 10px 16px;
+                background: #fff;
+                border-top: 1px solid #e2e8f0;
+                display: flex;
+                justify-content: center;
+            }
+            .cmms-assistant-foot-btn {
+                background: transparent;
+                border: none;
+                color: #64748b;
+                font-size: 12.5px;
+                cursor: pointer;
+                padding: 6px 12px;
+                border-radius: 6px;
+                transition: background .15s ease;
+            }
+            .cmms-assistant-foot-btn:hover {
+                background: #f1f5f9;
+                color: #1e293b;
+            }
+
+            /* ─── Mobile ──────────────────────────────────────── */
+            @media (max-width: 480px) {
+                .cmms-assistant-fab {
+                    bottom: 16px;
+                    inset-inline-end: 16px;
+                    width: 54px;
+                    height: 54px;
+                    font-size: 24px;
+                }
+                .cmms-assistant-panel {
+                    bottom: 0;
+                    inset-inline-end: 0;
+                    inset-inline-start: 0;
+                    width: 100%;
+                    max-width: 100%;
+                    height: 80vh;
+                    max-height: 80vh;
+                    border-radius: 16px 16px 0 0;
+                }
+            }
+        </style>
         <?php
     }
 
@@ -3436,7 +4432,7 @@ body {
         $t_tasks = CMMS_DB::table( 'tasks' );
 
         // Build my_open with range scope.
-        $my_open_sql = "SELECT COUNT(*) FROM $t_tasks WHERE account_id = %d AND assigned_to = %d AND status IN ('open','in_progress','waiting')";
+        $my_open_sql = "SELECT COUNT(*) FROM $t_tasks WHERE account_id = %d AND assigned_to = %d AND status IN ('open','in_progress','waiting') AND deleted_at IS NULL";
         $my_open_args = array( $u->account_id, $u->id );
         list( $extra_sql, $extra_args ) = CMMS_TimeRange::sql_clause(
             in_array( $range['key'], array( 'next_month', 'next_quarter' ), true ) ? 'due_date' : 'created_at',
@@ -3592,10 +4588,28 @@ body {
                     <div class="cmms-list">
                         <?php foreach ( $recent as $task ) $this->task_card( $task, $u ); ?>
                     </div>
+                    <?php // 1.14.80.4: also emit the inline-status-changer
+                          //   assets here (dashboard recent tasks). The
+                          //   method is idempotent — its static flag
+                          //   makes sure CSS+JS load once even if other
+                          //   sections on the page also call it. ?>
+                    <?php $this->inline_status_changer_assets(); ?>
                 <?php endif; ?>
             </div>
         </section>
         <?php
+    }
+
+    /**
+     * 1.15.8: Account members for inline-assign dropdowns, cached per
+     * request so we run one query regardless of how many cards render.
+     */
+    private function assign_members( $account_id ) {
+        $account_id = (int) $account_id;
+        if ( ! isset( $this->assign_members_cache[ $account_id ] ) ) {
+            $this->assign_members_cache[ $account_id ] = CMMS_Users::list_by_account( $account_id );
+        }
+        return $this->assign_members_cache[ $account_id ];
     }
 
     private function task_card( $task, $u = null ) {
@@ -3661,16 +4675,71 @@ body {
             $is_assignee = $u && isset( $task->assigned_to ) && (int) $task->assigned_to === (int) $u->id;
             $is_manager  = $u && isset( $task->manager_id )  && (int) $task->manager_id  === (int) $u->id;
 
+            // 1.15.8: Inline assign — managers/owners can reassign the
+            // "manager" (אחראי) and "assignee" (מוקצה ל) directly from
+            // the list. Compute current names + the member list once.
+            $can_assign = $u && in_array( $u->role, array( CMMS_Auth::ROLE_OWNER, CMMS_Auth::ROLE_MANAGER ), true );
+            $assignee_id   = isset( $task->assigned_to ) ? (int) $task->assigned_to : 0;
+            $manager_id    = isset( $task->manager_id )  ? (int) $task->manager_id  : 0;
+            $assignee_name = $assignee_id ? CMMS_Users::display_name( $assignee_id ) : '';
+            $manager_name  = $manager_id  ? CMMS_Users::display_name( $manager_id )  : '';
+            $assign_members = $can_assign ? $this->assign_members( $task->account_id ) : array();
+
+            // 1.14.80: status pill is clickable if the user has
+            // permission to change status on this task. The dropdown
+            // is rendered inline and toggled by JS. We use a wrapping
+            // <span> so we can intercept clicks (and stop propagation
+            // to the parent <a> which would otherwise navigate to the
+            // task page).
+            $can_change_status = $u && CMMS_Auth::can_participate_task( $u, $task );
+
+            // Status options for the dropdown. Excludes legacy 'closed'.
+            $status_options = array(
+                'open'        => array( 'label' => $this->t( 'status.open' ),        'dot' => '#EF9F27' ),
+                'in_progress' => array( 'label' => $this->t( 'status.in_progress' ), 'dot' => '#D85A30' ),
+                'waiting'     => array( 'label' => $this->t( 'status.waiting' ),     'dot' => '#F0997B' ),
+                'completed'   => array( 'label' => $this->t( 'status.completed' ),   'dot' => '#1D9E75' ),
+            );
             $url = $this->url( array( 'view' => 'task', 'id' => $task_id ) );
             ?>
-            <a class="cmms-task-card priority-<?php echo esc_attr( $priority ); ?>" href="<?php echo esc_url( $url ); ?>">
+            <a class="cmms-task-card priority-<?php echo esc_attr( $priority ); ?>" href="<?php echo esc_url( $url ); ?>" data-task-card-id="<?php echo (int) $task_id; ?>">
                 <div class="cmms-task-card-body">
                     <h4 class="cmms-task-card-title"><?php echo esc_html( $title ); ?></h4>
                     <div class="cmms-task-card-meta">
-                        <span class="cmms-badge status-<?php echo esc_attr( $status ); ?>">
-                            <span class="cmms-badge-dot"></span>
-                            <?php echo esc_html( $this->t( 'status.' . $status ) ); ?>
-                        </span>
+                        <?php if ( $can_change_status ) : ?>
+                            <span class="cmms-status-control"
+                                  data-task-id="<?php echo (int) $task_id; ?>"
+                                  data-current="<?php echo esc_attr( $status ); ?>">
+                                <button type="button" class="cmms-badge cmms-status-trigger status-<?php echo esc_attr( $status ); ?>"
+                                        aria-haspopup="menu" aria-expanded="false">
+                                    <span class="cmms-badge-dot"></span>
+                                    <span class="cmms-status-label"><?php echo esc_html( $this->t( 'status.' . $status ) ); ?></span>
+                                    <span class="cmms-status-caret" aria-hidden="true">⌄</span>
+                                </button>
+                                <template class="cmms-status-menu-template">
+                                    <div class="cmms-status-menu" role="menu">
+                                        <div class="cmms-status-menu-title"><?php esc_html_e( 'העבר ל:', 'cmms-light' ); ?></div>
+                                        <?php foreach ( $status_options as $opt_key => $opt ) :
+                                            $is_current = ( $opt_key === $status );
+                                        ?>
+                                            <div class="cmms-status-menu-item <?php echo $is_current ? 'is-current' : ''; ?>"
+                                                  data-status="<?php echo esc_attr( $opt_key ); ?>"
+                                                  role="menuitem"
+                                                  tabindex="<?php echo $is_current ? '-1' : '0'; ?>"
+                                                  aria-disabled="<?php echo $is_current ? 'true' : 'false'; ?>">
+                                                <span class="cmms-status-menu-dot" style="background:<?php echo esc_attr( $opt['dot'] ); ?>;"></span>
+                                                <span class="cmms-status-menu-label"><?php echo esc_html( $opt['label'] ); ?><?php echo $is_current ? ' ' . esc_html__( '(נוכחי)', 'cmms-light' ) : ''; ?></span>
+                                            </div>
+                                        <?php endforeach; ?>
+                                    </div>
+                                </template>
+                            </span>
+                        <?php else : ?>
+                            <span class="cmms-badge status-<?php echo esc_attr( $status ); ?>">
+                                <span class="cmms-badge-dot"></span>
+                                <?php echo esc_html( $this->t( 'status.' . $status ) ); ?>
+                            </span>
+                        <?php endif; ?>
                         <?php if ( $priority !== 'normal' ) : ?>
                             <span class="cmms-badge priority-<?php echo esc_attr( $priority ); ?>">
                                 <?php echo esc_html( $this->t( 'priority.' . $priority ) ); ?>
@@ -3698,6 +4767,49 @@ body {
                             </span>
                         <?php endif; ?>
                     </div>
+
+                    <?php // 1.15.8: Inline assign row (managers/owners only). ?>
+                    <?php if ( $can_assign ) : ?>
+                        <?php $this->inline_assign_assets(); ?>
+                        <div class="cmms-assign-row">
+                            <?php
+                            // Render one assign control. $field is
+                            // 'manager_id' (אחראי) or 'assigned_to' (מוקצה).
+                            $render_assign = function( $field, $label, $icon, $current_id, $current_name ) use ( $task_id, $assign_members, $u ) {
+                                ?>
+                                <span class="cmms-assign-control" data-task-id="<?php echo (int) $task_id; ?>" data-field="<?php echo esc_attr( $field ); ?>" data-current="<?php echo (int) $current_id; ?>">
+                                    <button type="button" class="cmms-assign-trigger" aria-haspopup="menu" aria-expanded="false">
+                                        <span class="cmms-assign-icon"><?php echo $icon; ?></span>
+                                        <span class="cmms-assign-label"><?php echo esc_html( $label ); ?>:</span>
+                                        <span class="cmms-assign-value <?php echo $current_id ? '' : 'is-empty'; ?>">
+                                            <?php echo $current_id ? esc_html( $current_name ) : esc_html__( 'להקצות', 'cmms-light' ); ?>
+                                        </span>
+                                        <span class="cmms-assign-caret" aria-hidden="true">⌄</span>
+                                    </button>
+                                    <template class="cmms-assign-menu-template">
+                                        <div class="cmms-assign-menu" role="menu">
+                                            <div class="cmms-assign-menu-item <?php echo ! $current_id ? 'is-current' : ''; ?>" data-user-id="0" role="menuitem">
+                                                <span class="cmms-assign-menu-label"><?php esc_html_e( '— ללא —', 'cmms-light' ); ?></span>
+                                            </div>
+                                            <?php foreach ( $assign_members as $m ) :
+                                                $mid = (int) $m->id;
+                                                $mname = ! empty( $m->display_name ) ? $m->display_name : ( ! empty( $m->user_email ) ? $m->user_email : ( '#' . $mid ) );
+                                                $is_cur = ( $mid === (int) $current_id );
+                                            ?>
+                                                <div class="cmms-assign-menu-item <?php echo $is_cur ? 'is-current' : ''; ?>" data-user-id="<?php echo $mid; ?>" role="menuitem">
+                                                    <span class="cmms-assign-menu-label"><?php echo esc_html( $mname ); ?><?php echo $is_cur ? ' ' . esc_html__( '(נוכחי)', 'cmms-light' ) : ''; ?></span>
+                                                </div>
+                                            <?php endforeach; ?>
+                                        </div>
+                                    </template>
+                                </span>
+                                <?php
+                            };
+                            $render_assign( 'manager_id', __( 'אחראי', 'cmms-light' ), '👤', $manager_id, $manager_name );
+                            $render_assign( 'assigned_to', __( 'מבצע', 'cmms-light' ), '🔧', $assignee_id, $assignee_name );
+                            ?>
+                        </div>
+                    <?php endif; ?>
                 </div>
             </a>
             <?php
@@ -3729,6 +4841,686 @@ body {
         }
     }
 
+    /**
+     * 1.14.80 — Inline status changer CSS + JS for task cards.
+     *
+     * Emitted once per page, AFTER the list of task_card() outputs.
+     * Static flag prevents double-emit if a page has multiple
+     * task lists (e.g. asset detail can have it twice if it ever
+     * renders).
+     *
+     * Reuses the existing cmms_kanban_status AJAX endpoint — that one
+     * already does nonce check + can_participate_task + status validation
+     * + audit log. No need for a new endpoint.
+     */
+    private function inline_status_changer_assets() {
+        static $emitted = false;
+        if ( $emitted ) return;
+        $emitted = true;
+
+        $nonce    = wp_create_nonce( 'cmms_kanban' );
+        $ajax_url = admin_url( 'admin-ajax.php' );
+
+        // i18n labels passed to JS so they're translatable.
+        $labels = array(
+            'open'        => $this->t( 'status.open' ),
+            'in_progress' => $this->t( 'status.in_progress' ),
+            'waiting'     => $this->t( 'status.waiting' ),
+            'completed'   => $this->t( 'status.completed' ),
+            'current'     => __( '(נוכחי)', 'cmms-light' ),
+            'updated'     => __( 'הסטטוס עודכן', 'cmms-light' ),
+            'failed'      => __( 'העדכון נכשל. נסה שוב.', 'cmms-light' ),
+            'network'     => __( 'שגיאת רשת. נסה שוב.', 'cmms-light' ),
+        );
+        ?>
+        <style>
+        /* 1.14.80.1 — Inline status changer.
+           Strategy: the trigger lives inside the task <a> (which is fine
+           since it's a <button> with preventDefault), but the dropdown
+           menu is rendered into a top-level container appended to <body>
+           with position: fixed. This bypasses ALL stacking contexts
+           (overflow:hidden parents, transforms, z-index issues) and
+           guarantees the menu floats above everything. */
+        .cmms-status-control {
+            position: relative;
+            display: inline-block;
+        }
+        .cmms-status-trigger {
+            cursor: pointer;
+            border: 1px solid transparent;
+            transition: box-shadow .12s ease, border-color .12s ease;
+            user-select: none;
+            -webkit-user-select: none;
+            font: inherit;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            -webkit-appearance: none;
+            appearance: none;
+        }
+        .cmms-status-trigger:hover { border-color: rgba(15,23,42,.18); }
+        .cmms-status-trigger:focus-visible {
+            outline: 0;
+            box-shadow: 0 0 0 2px rgba(79,70,229,.4);
+        }
+        .cmms-status-trigger.is-open {
+            box-shadow: 0 0 0 2px rgba(239,159,39,.4);
+            border-color: rgba(239,159,39,.4);
+        }
+        .cmms-status-caret {
+            font-size: 10px;
+            margin-inline-start: 2px;
+            opacity: .7;
+            transition: transform .15s ease;
+            display: inline-block;
+            line-height: 1;
+        }
+        .cmms-status-trigger.is-open .cmms-status-caret {
+            transform: rotate(180deg);
+        }
+
+        /* Floating menu — rendered as a body child. */
+        .cmms-status-menu-floating {
+            position: fixed;
+            background: #fff;
+            border: 1px solid rgba(15,23,42,.15);
+            border-radius: 10px;
+            box-shadow: 0 10px 32px rgba(15,23,42,.18);
+            padding: 4px;
+            min-width: 180px;
+            z-index: 999999;
+            display: flex;
+            flex-direction: column;
+            gap: 1px;
+            font-family: Arial, sans-serif;
+            animation: cmms-status-menu-in .12s ease;
+        }
+        @keyframes cmms-status-menu-in {
+            from { opacity: 0; transform: translateY(-4px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+        .cmms-status-menu-title {
+            font-size: 11px;
+            color: #64748b;
+            font-weight: 600;
+            padding: 6px 10px 4px;
+        }
+        .cmms-status-menu-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 13.5px;
+            color: #0f172a;
+            transition: background .12s ease;
+            text-align: start;
+            -webkit-tap-highlight-color: transparent;
+        }
+        .cmms-status-menu-item:hover:not(.is-current) { background: #f8fafc; }
+        .cmms-status-menu-item:focus-visible {
+            outline: 0;
+            background: #eef2ff;
+        }
+        .cmms-status-menu-item.is-current {
+            background: #f1f5f9;
+            color: #94a3b8;
+            cursor: default;
+        }
+        .cmms-status-menu-dot {
+            width: 9px;
+            height: 9px;
+            border-radius: 50%;
+            flex: none;
+        }
+
+        .cmms-task-card.cmms-saving { opacity: .65; pointer-events: none; }
+        .cmms-task-card.cmms-error { animation: cmms-status-shake .35s ease; }
+        @keyframes cmms-status-shake {
+            0%, 100% { transform: translateX(0); }
+            25%      { transform: translateX(-4px); }
+            75%      { transform: translateX(4px); }
+        }
+
+        @media (max-width: 640px) {
+            .cmms-status-menu-floating { min-width: 200px; }
+            .cmms-status-menu-item { padding: 12px 14px; font-size: 14.5px; }
+            .cmms-status-trigger { padding-top: 5px; padding-bottom: 5px; }
+        }
+
+        .cmms-inline-status-toast {
+            position: fixed;
+            bottom: 24px;
+            inset-inline-start: 50%;
+            transform: translateX(-50%);
+            background: #0f172a;
+            color: #fff;
+            padding: 11px 20px;
+            border-radius: 999px;
+            font-size: 13px;
+            font-weight: 500;
+            box-shadow: 0 6px 22px rgba(15,23,42,.3);
+            z-index: 999998;
+            opacity: 0;
+            transition: opacity .2s ease;
+            pointer-events: none;
+            font-family: Arial, sans-serif;
+        }
+        .cmms-inline-status-toast.is-visible { opacity: 1; }
+        .cmms-inline-status-toast.is-error { background: #b91c1c; }
+        </style>
+
+        <script>
+        (function () {
+            'use strict';
+            var controls = document.querySelectorAll('.cmms-status-control');
+            if (!controls.length) return;
+
+            var AJAX_URL = <?php echo wp_json_encode( $ajax_url ); ?>;
+            var NONCE    = <?php echo wp_json_encode( $nonce ); ?>;
+            var LABELS   = <?php echo wp_json_encode( $labels ); ?>;
+            var STATUS_CLASSES = ['open', 'in_progress', 'waiting', 'completed'];
+
+            // Toast singleton.
+            var toast = document.createElement('div');
+            toast.className = 'cmms-inline-status-toast';
+            toast.setAttribute('role', 'status');
+            toast.setAttribute('aria-live', 'polite');
+            document.body.appendChild(toast);
+            var toastTimer = null;
+            function showToast(msg, isError) {
+                toast.textContent = msg;
+                toast.classList.toggle('is-error', !!isError);
+                toast.classList.add('is-visible');
+                if (toastTimer) clearTimeout(toastTimer);
+                toastTimer = setTimeout(function () {
+                    toast.classList.remove('is-visible');
+                }, 2200);
+            }
+
+            // Currently open menu state (only one can be open).
+            var openMenu = null;      // floating DOM node
+            var openTrigger = null;   // the button that opened it
+            var openControl = null;   // the .cmms-status-control span
+
+            function closeMenu() {
+                if (openMenu) {
+                    openMenu.remove();
+                    openMenu = null;
+                }
+                if (openTrigger) {
+                    openTrigger.classList.remove('is-open');
+                    openTrigger.setAttribute('aria-expanded', 'false');
+                    openTrigger = null;
+                }
+                openControl = null;
+            }
+
+            // Position the floating menu under the trigger.
+            // Falls back to above if no room below.
+            function positionMenu(menu, trigger) {
+                var rect = trigger.getBoundingClientRect();
+                var menuRect = menu.getBoundingClientRect();
+                var vw = window.innerWidth;
+                var vh = window.innerHeight;
+
+                // Default: place below, aligned to the trigger's start edge.
+                var top = rect.bottom + 6;
+                var left = rect.left;
+
+                // RTL alignment: in RTL, align right edge of menu to right edge of trigger.
+                var isRTL = (document.dir === 'rtl' || document.documentElement.dir === 'rtl' ||
+                             getComputedStyle(document.body).direction === 'rtl');
+                if (isRTL) {
+                    left = rect.right - menuRect.width;
+                }
+
+                // Keep on screen horizontally.
+                if (left < 8) left = 8;
+                if (left + menuRect.width > vw - 8) left = vw - menuRect.width - 8;
+
+                // If menu would overflow bottom, place it above the trigger.
+                if (top + menuRect.height > vh - 8) {
+                    var aboveTop = rect.top - menuRect.height - 6;
+                    if (aboveTop > 8) top = aboveTop;
+                    // else: leave below, just clamp later
+                }
+                if (top < 8) top = 8;
+
+                menu.style.top = top + 'px';
+                menu.style.left = left + 'px';
+            }
+
+            function openMenuFor(control) {
+                if (openControl === control) {
+                    closeMenu();
+                    return;
+                }
+                closeMenu();
+
+                var trigger = control.querySelector('.cmms-status-trigger');
+                var template = control.querySelector('.cmms-status-menu-template');
+                if (!trigger || !template) return;
+
+                // Clone the template content into a floating menu.
+                var menuSource = template.content
+                    ? template.content.querySelector('.cmms-status-menu')
+                    : template.querySelector('.cmms-status-menu'); // fallback if <template> not supported
+                if (!menuSource) return;
+                var menu = menuSource.cloneNode(true);
+                menu.classList.add('cmms-status-menu-floating');
+                menu.classList.remove('cmms-status-menu'); // remove the inline-styled class
+                document.body.appendChild(menu);
+
+                // First add to DOM so we can measure, then position.
+                menu.style.visibility = 'hidden';
+                positionMenu(menu, trigger);
+                menu.style.visibility = '';
+
+                openMenu = menu;
+                openTrigger = trigger;
+                openControl = control;
+                trigger.classList.add('is-open');
+                trigger.setAttribute('aria-expanded', 'true');
+
+                // Wire menu items.
+                menu.querySelectorAll('.cmms-status-menu-item').forEach(function (item) {
+                    var itemTouchHandled = false;
+
+                    item.addEventListener('touchstart', function (e) {
+                        if (item.getAttribute('aria-disabled') === 'true') return;
+                        e.preventDefault();
+                        e.stopPropagation();
+                        itemTouchHandled = true;
+                        applyStatusChange(control, item.getAttribute('data-status'));
+                    }, { passive: false });
+
+                    item.addEventListener('touchend', function (e) {
+                        if (itemTouchHandled) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            setTimeout(function () { itemTouchHandled = false; }, 300);
+                        }
+                    }, { passive: false });
+
+                    item.addEventListener('click', function (e) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        if (itemTouchHandled) return;  // iOS synthesized click — already handled
+                        if (item.getAttribute('aria-disabled') === 'true') return;
+                        applyStatusChange(control, item.getAttribute('data-status'));
+                    });
+                });
+            }
+
+            function applyStatusChange(control, newStatus) {
+                var oldStatus = control.getAttribute('data-current');
+                var trigger   = control.querySelector('.cmms-status-trigger');
+                var labelEl   = trigger ? trigger.querySelector('.cmms-status-label') : null;
+                var card      = control.closest('.cmms-task-card');
+                var taskId    = control.getAttribute('data-task-id');
+
+                closeMenu();
+                if (!newStatus || newStatus === oldStatus) return;
+
+                // Optimistic UI.
+                if (labelEl) labelEl.textContent = LABELS[newStatus] || newStatus;
+                if (trigger) {
+                    STATUS_CLASSES.forEach(function (s) { trigger.classList.remove('status-' + s); });
+                    trigger.classList.add('status-' + newStatus);
+                }
+                control.setAttribute('data-current', newStatus);
+                if (card) card.classList.add('cmms-saving');
+
+                // Save.
+                var body = new URLSearchParams();
+                body.set('action',  'cmms_kanban_status');
+                body.set('nonce',   NONCE);
+                body.set('task_id', taskId);
+                body.set('status',  newStatus);
+
+                fetch(AJAX_URL, {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: body.toString()
+                })
+                .then(function (r) { return r.json().catch(function () { return null; }); })
+                .then(function (res) {
+                    if (card) card.classList.remove('cmms-saving');
+                    if (res && res.success) {
+                        showToast(LABELS.updated);
+                    } else {
+                        rollback();
+                        showToast((res && res.data && res.data.message) ? res.data.message : LABELS.failed, true);
+                    }
+                })
+                .catch(function () {
+                    if (card) card.classList.remove('cmms-saving');
+                    rollback();
+                    showToast(LABELS.network, true);
+                });
+
+                function rollback() {
+                    if (labelEl) labelEl.textContent = LABELS[oldStatus] || oldStatus;
+                    if (trigger) {
+                        STATUS_CLASSES.forEach(function (s) { trigger.classList.remove('status-' + s); });
+                        trigger.classList.add('status-' + oldStatus);
+                    }
+                    control.setAttribute('data-current', oldStatus);
+                    if (card) {
+                        card.classList.add('cmms-error');
+                        setTimeout(function () { card.classList.remove('cmms-error'); }, 400);
+                    }
+                }
+            }
+
+            // Wire each trigger button.
+            controls.forEach(function (control) {
+                var trigger = control.querySelector('.cmms-status-trigger');
+                if (!trigger) return;
+
+                // 1.14.80.3 — Mobile fix.
+                // The trigger lives inside an <a>. On iOS Safari, a tap
+                // on this button triggers: touchstart → touchend → click
+                // → navigation. To intercept the navigation we MUST
+                // preventDefault on touchstart with passive:false, which
+                // stops the whole event chain before iOS schedules the
+                // synthesized click. Without this, the <a>'s href fires.
+                //
+                // On desktop, the same flow works via the click handler
+                // below — but we still preventDefault on mousedown to
+                // stop browsers that begin navigation on mousedown.
+
+                var touchHandled = false;
+
+                trigger.addEventListener('touchstart', function (e) {
+                    e.preventDefault();    // CRITICAL: stops the synthesized click + nav
+                    e.stopPropagation();
+                    touchHandled = true;
+                    openMenuFor(control);
+                }, { passive: false });
+
+                trigger.addEventListener('touchend', function (e) {
+                    if (touchHandled) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        // Reset flag on next tick so subsequent taps work.
+                        setTimeout(function () { touchHandled = false; }, 300);
+                    }
+                }, { passive: false });
+
+                trigger.addEventListener('mousedown', function (e) {
+                    e.stopPropagation();
+                }, { passive: true });
+
+                trigger.addEventListener('click', function (e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    // If this click came from a tap we already handled
+                    // via touchstart, ignore it (iOS synthesized click).
+                    if (touchHandled) return false;
+                    openMenuFor(control);
+                    return false;
+                });
+
+                // Keyboard support.
+                trigger.addEventListener('keydown', function (e) {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        openMenuFor(control);
+                    }
+                });
+            });
+
+            // Click outside → close.
+            document.addEventListener('click', function (e) {
+                if (!openMenu) return;
+                if (e.target.closest('.cmms-status-menu-floating')) return;
+                if (e.target.closest('.cmms-status-trigger')) return;
+                closeMenu();
+            });
+
+            // Escape → close.
+            document.addEventListener('keydown', function (e) {
+                if (e.key === 'Escape') closeMenu();
+            });
+
+            // Scroll / resize → close (avoids menu drifting away from trigger).
+            window.addEventListener('scroll', function () {
+                if (openMenu) closeMenu();
+            }, true);
+            window.addEventListener('resize', function () {
+                if (openMenu) closeMenu();
+            });
+        })();
+        </script>
+        <?php
+    }
+
+    /**
+     * 1.15.8 — Inline assign (אחראי / מבצע) CSS + JS for task cards.
+     * Emitted once per page (static flag). Mirrors the status changer:
+     * a trigger button inside the card opens a menu of account members;
+     * picking one POSTs to cmms_task_assign and updates the label inline.
+     */
+    private function inline_assign_assets() {
+        static $done = false;
+        if ( $done ) return;
+        $done = true;
+        $nonce = wp_create_nonce( 'cmms_task_assign' );
+        ?>
+        <style>
+        .cmms-assign-row {
+            display: flex; flex-wrap: wrap; gap: 8px;
+            margin-top: 8px; padding-top: 8px;
+            border-top: 1px solid var(--c-border, #e2e8f0);
+        }
+        .cmms-assign-control { position: relative; display: inline-flex; }
+        .cmms-assign-trigger {
+            display: inline-flex; align-items: center; gap: 4px;
+            background: #f8fafc; border: 1px solid #e2e8f0;
+            border-radius: 6px; padding: 3px 8px; font-size: 11px;
+            color: #475569; cursor: pointer; line-height: 1.4;
+        }
+        .cmms-assign-trigger:hover { background: #f1f5f9; border-color: #cbd5e1; }
+        .cmms-assign-icon { font-size: 12px; }
+        .cmms-assign-label { color: #94a3b8; }
+        .cmms-assign-value { font-weight: 600; color: #0f172a; }
+        .cmms-assign-value.is-empty { color: #2563eb; font-weight: 500; }
+        .cmms-assign-caret { font-size: 9px; opacity: 0.6; }
+        .cmms-assign-menu {
+            position: absolute; top: calc(100% + 4px); right: 0;
+            background: #fff; border: 1px solid #e2e8f0; border-radius: 8px;
+            box-shadow: 0 8px 24px rgba(15,23,42,0.14);
+            padding: 4px; min-width: 180px; max-height: 260px;
+            overflow-y: auto; z-index: 9999;
+            /* No transition — appear instantly. The card's `transition:
+               all` would otherwise animate the menu in over ~200ms,
+               which looked like a multi-second lag while it settled. */
+            transition: none !important;
+            animation: none !important;
+        }
+        /* The card animates its transform/border on hover; that must not
+           cascade into the absolutely-positioned menu. */
+        .cmms-assign-control, .cmms-assign-menu, .cmms-assign-menu * {
+            transition: none !important;
+        }
+        .cmms-assign-menu-item {
+            padding: 7px 10px; border-radius: 5px; font-size: 12px;
+            color: #334155; cursor: pointer; white-space: nowrap;
+        }
+        .cmms-assign-menu-item:hover { background: #f1f5f9; }
+        .cmms-assign-menu-item.is-current { background: #eff6ff; color: #1e40af; font-weight: 600; }
+        </style>
+        <script>
+        (function () {
+            if (window.__cmmsAssignBound) return;
+            window.__cmmsAssignBound = true;
+
+            var AJAX = <?php echo wp_json_encode( admin_url( 'admin-ajax.php' ) ); ?>;
+            var NONCE = <?php echo wp_json_encode( $nonce ); ?>;
+            var openMenu = null;
+
+            function closeMenu() {
+                if (openMenu && openMenu.parentNode) openMenu.parentNode.removeChild(openMenu);
+                openMenu = null;
+            }
+
+            document.addEventListener('click', function (e) {
+                var trigger = e.target.closest('.cmms-assign-trigger');
+                if (trigger) {
+                    // Don't navigate the parent <a>.
+                    e.preventDefault();
+                    e.stopPropagation();
+                    var control = trigger.closest('.cmms-assign-control');
+                    openFor(control, trigger);
+                    return;
+                }
+                var item = e.target.closest('.cmms-assign-menu-item');
+                if (item) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    handlePick(item);
+                    return;
+                }
+                // Click elsewhere → close.
+                if (!e.target.closest('.cmms-assign-menu')) closeMenu();
+            });
+
+            function openFor(control, trigger) {
+                if (openMenu) { closeMenu(); }
+                var tpl = control.querySelector('.cmms-assign-menu-template');
+                if (!tpl) return;
+                var menu = tpl.content.firstElementChild.cloneNode(true);
+                menu.__control = control;
+
+                // Render the menu on <body> with fixed positioning rather
+                // than inside the card. Inside the card it was being
+                // clipped by an ancestor's overflow (the card / list
+                // container), which is why it appeared cut off until a
+                // reflow "freed" it. On body + fixed, nothing clips it.
+                menu.style.position = 'fixed';
+                menu.style.zIndex = '99999';
+                document.body.appendChild(menu);
+
+                // Position it under the trigger. Align to the trigger's
+                // right edge (RTL-friendly) and just below it.
+                var rect = trigger.getBoundingClientRect();
+                var menuWidth = menu.offsetWidth || 180;
+                var left = rect.right - menuWidth;
+                if (left < 8) left = 8; // keep on-screen
+                var top = rect.bottom + 4;
+
+                // If it would overflow the bottom of the viewport, open
+                // upward instead.
+                var menuHeight = menu.offsetHeight || 200;
+                if (top + menuHeight > window.innerHeight - 8) {
+                    top = rect.top - menuHeight - 4;
+                    if (top < 8) top = 8;
+                }
+
+                menu.style.left = left + 'px';
+                menu.style.top = top + 'px';
+                menu.style.right = 'auto';
+
+                openMenu = menu;
+            }
+
+            function handlePick(item) {
+                var menu = item.closest('.cmms-assign-menu');
+                var control = menu ? menu.__control : null;
+                if (!control) { closeMenu(); return; }
+
+                var taskId = control.getAttribute('data-task-id');
+                var field  = control.getAttribute('data-field');
+                var userId = item.getAttribute('data-user-id');
+                var newName = item.querySelector('.cmms-assign-menu-label').textContent
+                                  .replace(' (נוכחי)', '').trim();
+
+                var valueEl = control.querySelector('.cmms-assign-value');
+                var oldText = valueEl ? valueEl.textContent : '';
+                var card = control.closest('.cmms-task-card');
+
+                closeMenu();
+
+                // Optimistic update.
+                if (valueEl) {
+                    if (userId === '0') {
+                        valueEl.textContent = 'להקצות';
+                        valueEl.classList.add('is-empty');
+                    } else {
+                        valueEl.textContent = newName;
+                        valueEl.classList.remove('is-empty');
+                    }
+                }
+                control.setAttribute('data-current', userId);
+                if (card) card.classList.add('cmms-saving');
+
+                var body = new URLSearchParams();
+                body.set('action', 'cmms_task_assign');
+                body.set('nonce', NONCE);
+                body.set('task_id', taskId);
+                body.set('field', field);
+                body.set('user_id', userId);
+
+                fetch(AJAX, {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: body.toString()
+                })
+                .then(function (r) { return r.json(); })
+                .then(function (res) {
+                    if (card) card.classList.remove('cmms-saving');
+                    if (!res || !res.success) {
+                        // Rollback.
+                        if (valueEl) valueEl.textContent = oldText;
+                        showToast((res && res.data && res.data.message) || 'שמירה נכשלה', true);
+                    } else {
+                        showToast('נשמר ✓', false);
+                    }
+                })
+                .catch(function () {
+                    if (card) card.classList.remove('cmms-saving');
+                    if (valueEl) valueEl.textContent = oldText;
+                    showToast('שגיאת רשת', true);
+                });
+            }
+
+            // Reuse the status toast if present, else make a minimal one.
+            function showToast(msg, isError) {
+                var toast = document.querySelector('.cmms-inline-status-toast');
+                if (!toast) {
+                    toast = document.createElement('div');
+                    toast.className = 'cmms-inline-status-toast';
+                    document.body.appendChild(toast);
+                }
+                toast.textContent = msg;
+                toast.classList.toggle('is-error', !!isError);
+                toast.classList.add('is-visible');
+                setTimeout(function () { toast.classList.remove('is-visible'); }, 2000);
+            }
+
+            document.addEventListener('keydown', function (e) {
+                if (e.key === 'Escape' && openMenu) closeMenu();
+            });
+            window.addEventListener('resize', function () {
+                if (openMenu) closeMenu();
+            });
+            // Fixed-positioned menu won't follow the page on scroll, so
+            // close it when the user scrolls (capture phase catches
+            // scrolls on inner containers too).
+            window.addEventListener('scroll', function () {
+                if (openMenu) closeMenu();
+            }, true);
+        })();
+        </script>
+        <?php
+    }
+
     private function empty_state( $icon, $title_key, $desc_key, $cta_html = '' ) {
         ?>
         <div class="cmms-empty">
@@ -3751,6 +5543,29 @@ body {
         if ( ! empty( $_GET['as_manager'] ) ) $filters['as_manager'] = 1;
         if ( ! empty( $_GET['overdue'] ) ) $filters['overdue'] = 1;
         if ( ! empty( $_GET['category_id'] ) ) $filters['category_id'] = (int) $_GET['category_id'];
+        // 1.14.79: "mine" UX filter — applied at the DB level via
+        // list_for_user. Server-side, so even with thousands of tasks
+        // in the account only the user's own rows are fetched/rendered.
+        if ( ! empty( $_GET['mine'] ) ) $filters['mine'] = 1;
+
+        // 1.15.2: Multi-user filter — privileged users (owner/manager)
+        // can pick one or more team members and see tasks where any of
+        // them is involved (assignee/manager/creator). Comes in as
+        // ?users[]=1&users[]=2 in the URL. Sanitized to ints, empties
+        // dropped, and only honored for privileged roles (UI hides
+        // the dropdown from others; SQL ignores the filter regardless).
+        if ( ! empty( $_GET['users'] ) && is_array( $_GET['users'] ) ) {
+            $user_ids = array_filter( array_map( 'intval', wp_unslash( $_GET['users'] ) ) );
+            if ( ! empty( $user_ids ) && in_array( $u->role, array( CMMS_Auth::ROLE_OWNER, CMMS_Auth::ROLE_MANAGER ), true ) ) {
+                $filters['users'] = array_values( $user_ids );
+            }
+        }
+
+        // 1.14.81.1: no_due_date filter — used by the "X משימות ללא
+        // תאריך יעד" banner in the calendar view. Lets the user jump
+        // from the calendar to a filtered list of just those tasks so
+        // they can set due-dates and have them appear on the calendar.
+        if ( ! empty( $_GET['no_due_date'] ) ) $filters['no_due_date'] = 1;
 
         // Apply time range
         if ( ! empty( $range['from'] ) || ! empty( $range['to'] ) ) {
@@ -3774,15 +5589,217 @@ body {
             </div>
         </div>
 
+        <?php // 1.14.79: scope pills — [הכל] [רק שלי].
+              // Sits ABOVE the status pills so it's clearly a different
+              // axis (scope) than status (state). Privileged users
+              // (owner/manager) see the toggle since they're the ones
+              // who see "all" by default and might want to narrow to
+              // their own work. Non-privileged users only ever see
+              // their related set, so the pill is hidden (would be a no-op).
+              $is_priv_role = in_array( $u->role, array( CMMS_Auth::ROLE_OWNER, CMMS_Auth::ROLE_MANAGER ), true );
+              if ( $is_priv_role ) :
+                  $url_all  = $this->url( array( 'view' => 'tasks' ) );
+                  // Preserve other filters when toggling scope.
+                  $current_qs = array_filter( array(
+                      'status'      => $filters['status']      ?? '',
+                      'as_assignee' => ! empty( $filters['as_assignee'] ) ? 1 : '',
+                      'as_manager'  => ! empty( $filters['as_manager'] )  ? 1 : '',
+                      'overdue'     => ! empty( $filters['overdue'] )     ? 1 : '',
+                      'category_id' => $filters['category_id'] ?? '',
+                  ) );
+                  $url_mine = $this->url( array_merge( array( 'view' => 'tasks', 'mine' => 1 ), $current_qs ) );
+                  $url_all_link = $this->url( array_merge( array( 'view' => 'tasks' ), $current_qs ) );
+                  $is_mine = ! empty( $filters['mine'] );
+
+                  // 1.15.2: Multi-user filter dropdown. Load the team
+                  // member list once, render a checkbox list, submit
+                  // as a form (GET). Selected IDs come back as users[].
+                  $team_members      = CMMS_Users::list_by_account( $u->account_id );
+                  $selected_user_ids = ! empty( $filters['users'] ) ? array_map( 'intval', $filters['users'] ) : array();
+                  $selected_count    = count( $selected_user_ids );
+        ?>
+        <div class="cmms-flex cmms-gap-2 cmms-mb-3" style="flex-wrap:wrap;">
+            <a class="cmms-btn cmms-btn-sm <?php echo ! $is_mine && empty( $selected_user_ids ) ? 'cmms-btn-secondary' : ''; ?>"
+               href="<?php echo esc_url( $url_all_link ); ?>"><?php esc_html_e( 'הכל', 'cmms-light' ); ?></a>
+            <a class="cmms-btn cmms-btn-sm <?php echo $is_mine ? 'cmms-btn-secondary' : ''; ?>"
+               href="<?php echo esc_url( $url_mine ); ?>">
+                👤 <?php esc_html_e( 'רק שלי', 'cmms-light' ); ?>
+            </a>
+
+            <?php // ── Multi-user dropdown ── ?>
+            <div class="cmms-user-filter-wrap" style="position:relative;display:inline-block;">
+                <button type="button"
+                        class="cmms-btn cmms-btn-sm cmms-user-filter-toggle <?php echo $selected_count > 0 ? 'cmms-btn-secondary' : ''; ?>"
+                        style="display:inline-flex;align-items:center;gap:6px;">
+                    👥
+                    <?php if ( $selected_count > 0 ) : ?>
+                        <?php printf( esc_html__( '%d משתמשים נבחרו', 'cmms-light' ), $selected_count ); ?>
+                    <?php else : ?>
+                        <?php esc_html_e( 'משתמשים נוספים', 'cmms-light' ); ?>
+                    <?php endif; ?>
+                    <span style="font-size:10px;opacity:0.7;">▾</span>
+                </button>
+
+                <div class="cmms-user-filter-panel"
+                     style="display:none;position:absolute;top:calc(100% + 4px);right:0;
+                            background:#fff;border:1px solid #e2e8f0;border-radius:8px;
+                            box-shadow:0 8px 24px rgba(15,23,42,0.12);
+                            padding:10px;min-width:240px;max-width:320px;z-index:50;">
+                    <form method="get" action="">
+                        <?php
+                        // Preserve other GET params when submitting the
+                        // user-filter form. Without this, choosing users
+                        // would reset status/category/etc filters.
+                        $preserved = array_filter( array(
+                            'view'        => 'tasks',
+                            'status'      => $filters['status']      ?? '',
+                            'as_assignee' => ! empty( $filters['as_assignee'] ) ? 1 : '',
+                            'as_manager'  => ! empty( $filters['as_manager'] )  ? 1 : '',
+                            'overdue'     => ! empty( $filters['overdue'] )     ? 1 : '',
+                            'category_id' => $filters['category_id'] ?? '',
+                            'mine'        => ! empty( $filters['mine'] ) ? 1 : '',
+                        ) );
+                        foreach ( $preserved as $key => $val ) :
+                        ?>
+                            <input type="hidden" name="<?php echo esc_attr( $key ); ?>" value="<?php echo esc_attr( $val ); ?>">
+                        <?php endforeach; ?>
+
+                        <?php // Search box (helpful when there are many users) ?>
+                        <input type="text"
+                               class="cmms-input cmms-user-filter-search"
+                               placeholder="<?php esc_attr_e( 'חיפוש משתמש...', 'cmms-light' ); ?>"
+                               style="width:100%;margin-bottom:8px;font-size:12px;padding:6px 8px;">
+
+                        <div class="cmms-user-filter-list"
+                             style="max-height:280px;overflow-y:auto;border:1px solid #f1f5f9;border-radius:6px;padding:6px;">
+                            <?php if ( empty( $team_members ) ) : ?>
+                                <div style="font-size:12px;color:#64748b;padding:8px;text-align:center;">
+                                    <?php esc_html_e( 'אין משתמשים אחרים', 'cmms-light' ); ?>
+                                </div>
+                            <?php else : ?>
+                                <?php foreach ( $team_members as $member ) :
+                                    $is_checked   = in_array( (int) $member->id, $selected_user_ids, true );
+                                    $is_me        = ( (int) $member->id === (int) $u->id );
+                                    // Field name varies historically — display_name is the
+                                    // canonical column, but defend against legacy/missing data
+                                    // by falling back to user_email or a placeholder.
+                                    $display_name = '';
+                                    if ( ! empty( $member->display_name ) )      $display_name = $member->display_name;
+                                    elseif ( ! empty( $member->name ) )          $display_name = $member->name;
+                                    elseif ( ! empty( $member->user_email ) )    $display_name = $member->user_email;
+                                    elseif ( ! empty( $member->email ) )         $display_name = $member->email;
+                                    else                                          $display_name = '#' . (int) $member->id;
+                                    $search_email = $member->user_email ?? ( $member->email ?? '' );
+                                ?>
+                                    <label class="cmms-user-filter-row"
+                                           data-search-text="<?php echo esc_attr( strtolower( $display_name . ' ' . $search_email ) ); ?>"
+                                           style="display:flex;align-items:center;gap:8px;padding:6px 4px;cursor:pointer;border-radius:4px;font-size:12px;">
+                                        <input type="checkbox"
+                                               name="users[]"
+                                               value="<?php echo (int) $member->id; ?>"
+                                               <?php checked( $is_checked ); ?>
+                                               style="margin:0;flex-shrink:0;">
+                                        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                                            <?php echo esc_html( $display_name ); ?>
+                                            <?php if ( $is_me ) : ?>
+                                                <span style="color:#64748b;font-size:10px;">(<?php esc_html_e( 'אני', 'cmms-light' ); ?>)</span>
+                                            <?php endif; ?>
+                                        </span>
+                                    </label>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
+                        </div>
+
+                        <div style="display:flex;gap:6px;margin-top:8px;">
+                            <button type="submit" class="cmms-btn cmms-btn-sm cmms-btn-primary" style="flex:1;font-size:11px;">
+                                <?php esc_html_e( 'החל', 'cmms-light' ); ?>
+                            </button>
+                            <?php if ( $selected_count > 0 ) : ?>
+                                <a href="<?php echo esc_url( $url_all_link ); ?>"
+                                   class="cmms-btn cmms-btn-sm cmms-btn-ghost"
+                                   style="flex:1;font-size:11px;text-align:center;">
+                                    <?php esc_html_e( 'נקה', 'cmms-light' ); ?>
+                                </a>
+                            <?php endif; ?>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <script>
+        (function() {
+            if ( window.__cmmsUserFilterBound ) return;
+            window.__cmmsUserFilterBound = true;
+
+            // ── Toggle dropdown open/close ──
+            document.addEventListener('click', function(e) {
+                var toggle = e.target.closest('.cmms-user-filter-toggle');
+                if ( toggle ) {
+                    e.preventDefault();
+                    var wrap = toggle.closest('.cmms-user-filter-wrap');
+                    var panel = wrap.querySelector('.cmms-user-filter-panel');
+                    var isOpen = panel.style.display === 'block';
+                    // Close any other open panels (only one open at a time).
+                    document.querySelectorAll('.cmms-user-filter-panel').forEach(function(p) {
+                        p.style.display = 'none';
+                    });
+                    panel.style.display = isOpen ? 'none' : 'block';
+                    if ( ! isOpen ) {
+                        var search = panel.querySelector('.cmms-user-filter-search');
+                        if ( search ) setTimeout(function() { search.focus(); }, 50);
+                    }
+                    return;
+                }
+                // Click outside any panel — close everything.
+                if ( ! e.target.closest('.cmms-user-filter-wrap') ) {
+                    document.querySelectorAll('.cmms-user-filter-panel').forEach(function(p) {
+                        p.style.display = 'none';
+                    });
+                }
+            });
+
+            // ── Hover effect on user rows ──
+            document.addEventListener('mouseover', function(e) {
+                var row = e.target.closest('.cmms-user-filter-row');
+                if ( row ) row.style.background = '#f8fafc';
+            });
+            document.addEventListener('mouseout', function(e) {
+                var row = e.target.closest('.cmms-user-filter-row');
+                if ( row ) row.style.background = '';
+            });
+
+            // ── Search filter ──
+            document.addEventListener('input', function(e) {
+                var search = e.target.closest('.cmms-user-filter-search');
+                if ( ! search ) return;
+                var query = search.value.toLowerCase().trim();
+                var panel = search.closest('.cmms-user-filter-panel');
+                panel.querySelectorAll('.cmms-user-filter-row').forEach(function(row) {
+                    var text = row.getAttribute('data-search-text') || '';
+                    row.style.display = ( query === '' || text.indexOf(query) !== -1 ) ? '' : 'none';
+                });
+            });
+        })();
+        </script>
+        <?php endif; ?>
+
         <!-- Filter pills -->
         <div class="cmms-flex cmms-gap-2 cmms-mb-4" style="flex-wrap:wrap;">
-            <a class="cmms-btn cmms-btn-sm <?php echo empty( $filters ) ? 'cmms-btn-secondary' : ''; ?>" href="<?php echo esc_url( $this->url( array( 'view' => 'tasks' ) ) ); ?>"><?php $this->e( 'filter.all' ); ?></a>
-            <a class="cmms-btn cmms-btn-sm <?php echo ( $filters['status'] ?? '' ) === 'open' ? 'cmms-btn-secondary' : ''; ?>" href="<?php echo esc_url( $this->url( array( 'view' => 'tasks', 'status' => 'open' ) ) ); ?>"><?php $this->e( 'status.open' ); ?></a>
-            <a class="cmms-btn cmms-btn-sm <?php echo ( $filters['status'] ?? '' ) === 'in_progress' ? 'cmms-btn-secondary' : ''; ?>" href="<?php echo esc_url( $this->url( array( 'view' => 'tasks', 'status' => 'in_progress' ) ) ); ?>"><?php $this->e( 'status.in_progress' ); ?></a>
-            <a class="cmms-btn cmms-btn-sm <?php echo ( $filters['status'] ?? '' ) === 'completed' ? 'cmms-btn-secondary' : ''; ?>" href="<?php echo esc_url( $this->url( array( 'view' => 'tasks', 'status' => 'completed' ) ) ); ?>"><?php $this->e( 'status.completed' ); ?></a>
-            <a class="cmms-btn cmms-btn-sm <?php echo ! empty( $filters['as_assignee'] ) ? 'cmms-btn-secondary' : ''; ?>" href="<?php echo esc_url( $this->url( array( 'view' => 'tasks', 'as_assignee' => 1 ) ) ); ?>"><?php CMMS_Icons::e( 'wrench', 14 ); ?> <?php $this->e( 'filter.as_assignee' ); ?></a>
-            <a class="cmms-btn cmms-btn-sm <?php echo ! empty( $filters['as_manager'] ) ? 'cmms-btn-secondary' : ''; ?>" href="<?php echo esc_url( $this->url( array( 'view' => 'tasks', 'as_manager' => 1 ) ) ); ?>"><?php CMMS_Icons::e( 'briefcase', 14 ); ?> <?php $this->e( 'filter.as_manager' ); ?></a>
-            <a class="cmms-btn cmms-btn-sm <?php echo ! empty( $filters['overdue'] ) ? 'cmms-btn-secondary' : ''; ?>" href="<?php echo esc_url( $this->url( array( 'view' => 'tasks', 'overdue' => 1 ) ) ); ?>" style="<?php echo ! empty( $filters['overdue'] ) ? '' : 'color:var(--c-red-600);'; ?>"><?php CMMS_Icons::e( 'alert-triangle', 14 ); ?> <?php $this->e( 'task.overdue' ); ?></a>
+            <?php
+                // Helper: build a URL that preserves the current "mine"
+                // selection across status changes. Without this, clicking
+                // a status pill while "mine" is active would silently
+                // drop the scope.
+                $mine_args = ! empty( $filters['mine'] ) ? array( 'mine' => 1 ) : array();
+            ?>
+            <a class="cmms-btn cmms-btn-sm <?php echo empty( $filters['status'] ) && empty( $filters['as_assignee'] ) && empty( $filters['as_manager'] ) && empty( $filters['overdue'] ) ? 'cmms-btn-secondary' : ''; ?>" href="<?php echo esc_url( $this->url( array_merge( array( 'view' => 'tasks' ), $mine_args ) ) ); ?>"><?php $this->e( 'filter.all' ); ?></a>
+            <a class="cmms-btn cmms-btn-sm <?php echo ( $filters['status'] ?? '' ) === 'open' ? 'cmms-btn-secondary' : ''; ?>" href="<?php echo esc_url( $this->url( array_merge( array( 'view' => 'tasks', 'status' => 'open' ), $mine_args ) ) ); ?>"><?php $this->e( 'status.open' ); ?></a>
+            <a class="cmms-btn cmms-btn-sm <?php echo ( $filters['status'] ?? '' ) === 'in_progress' ? 'cmms-btn-secondary' : ''; ?>" href="<?php echo esc_url( $this->url( array_merge( array( 'view' => 'tasks', 'status' => 'in_progress' ), $mine_args ) ) ); ?>"><?php $this->e( 'status.in_progress' ); ?></a>
+            <a class="cmms-btn cmms-btn-sm <?php echo ( $filters['status'] ?? '' ) === 'completed' ? 'cmms-btn-secondary' : ''; ?>" href="<?php echo esc_url( $this->url( array_merge( array( 'view' => 'tasks', 'status' => 'completed' ), $mine_args ) ) ); ?>"><?php $this->e( 'status.completed' ); ?></a>
+            <a class="cmms-btn cmms-btn-sm <?php echo ! empty( $filters['as_assignee'] ) ? 'cmms-btn-secondary' : ''; ?>" href="<?php echo esc_url( $this->url( array_merge( array( 'view' => 'tasks', 'as_assignee' => 1 ), $mine_args ) ) ); ?>"><?php CMMS_Icons::e( 'wrench', 14 ); ?> <?php $this->e( 'filter.as_assignee' ); ?></a>
+            <a class="cmms-btn cmms-btn-sm <?php echo ! empty( $filters['as_manager'] ) ? 'cmms-btn-secondary' : ''; ?>" href="<?php echo esc_url( $this->url( array_merge( array( 'view' => 'tasks', 'as_manager' => 1 ), $mine_args ) ) ); ?>"><?php CMMS_Icons::e( 'briefcase', 14 ); ?> <?php $this->e( 'filter.as_manager' ); ?></a>
+            <a class="cmms-btn cmms-btn-sm <?php echo ! empty( $filters['overdue'] ) ? 'cmms-btn-secondary' : ''; ?>" href="<?php echo esc_url( $this->url( array_merge( array( 'view' => 'tasks', 'overdue' => 1 ), $mine_args ) ) ); ?>" style="<?php echo ! empty( $filters['overdue'] ) ? '' : 'color:var(--c-red-600);'; ?>"><?php CMMS_Icons::e( 'alert-triangle', 14 ); ?> <?php $this->e( 'task.overdue' ); ?></a>
         </div>
 
         <?php if ( empty( $tasks ) ) : ?>
@@ -3794,9 +5811,126 @@ body {
                 </div>
             </div>
         <?php else : ?>
-            <div class="cmms-list">
+            <?php // 1.14.77 — View toggle: List / Kanban / Calendar.
+                  // Default to List (preserves existing behavior). The
+                  // chosen view persists in localStorage per browser
+                  // so users don't have to flip every visit.
+                  // 1.14.81 — Added Calendar view. ?>
+            <div class="cmms-tasks-view-toggle" role="tablist" aria-label="<?php esc_attr_e( 'תצוגת משימות', 'cmms-light' ); ?>"
+                 style="display:inline-flex;background:#eef2f7;border-radius:8px;padding:3px;margin-bottom:14px;flex-wrap:wrap;">
+                <button type="button" data-tasks-view="list" role="tab"
+                        class="cmms-tasks-view-btn is-active"
+                        aria-selected="true"
+                        style="border:0;background:#fff;color:#0f172a;padding:6px 14px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;box-shadow:0 1px 2px rgba(15,23,42,.08);">
+                    📋 רשימה
+                </button>
+                <button type="button" data-tasks-view="kanban" role="tab"
+                        class="cmms-tasks-view-btn"
+                        aria-selected="false"
+                        style="border:0;background:transparent;color:#64748b;padding:6px 14px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;">
+                    🗂 Kanban
+                </button>
+                <button type="button" data-tasks-view="calendar" role="tab"
+                        class="cmms-tasks-view-btn"
+                        aria-selected="false"
+                        style="border:0;background:transparent;color:#64748b;padding:6px 14px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;">
+                    📅 חודש
+                </button>
+            </div>
+
+            <div class="cmms-list" data-tasks-view-pane="list">
                 <?php foreach ( $tasks as $task ) $this->task_card( $task, $u ); ?>
             </div>
+            <?php $this->inline_status_changer_assets(); ?>
+
+            <div data-tasks-view-pane="kanban" hidden>
+                <?php $this->render_kanban_board( $tasks, $u, 'tasks-main' ); ?>
+            </div>
+
+            <div data-tasks-view-pane="calendar" hidden>
+                <?php $this->render_calendar_view( $u, $filters ); ?>
+            </div>
+
+            <script>
+            (function () {
+                'use strict';
+                var buttons = document.querySelectorAll('[data-tasks-view]');
+                var panes   = document.querySelectorAll('[data-tasks-view-pane]');
+                if (!buttons.length || !panes.length) return;
+                var KEY = 'cmms_tasks_view';
+
+                function apply(view) {
+                    buttons.forEach(function (b) {
+                        var on = (b.getAttribute('data-tasks-view') === view);
+                        b.classList.toggle('is-active', on);
+                        b.setAttribute('aria-selected', on ? 'true' : 'false');
+                        if (on) {
+                            b.style.background = '#fff';
+                            b.style.color = '#0f172a';
+                            b.style.boxShadow = '0 1px 2px rgba(15,23,42,.08)';
+                        } else {
+                            b.style.background = 'transparent';
+                            b.style.color = '#64748b';
+                            b.style.boxShadow = 'none';
+                        }
+                    });
+                    panes.forEach(function (p) {
+                        p.hidden = (p.getAttribute('data-tasks-view-pane') !== view);
+                    });
+                    try { localStorage.setItem(KEY, view); } catch (e) {}
+                }
+
+                buttons.forEach(function (b) {
+                    b.addEventListener('click', function () {
+                        var view = b.getAttribute('data-tasks-view');
+                        apply(view);
+                        // 1.14.81.1: also update the URL so refreshes
+                        // and chevron-navigation in the calendar don't
+                        // bounce the user back to list view. We use
+                        // history.replaceState (not pushState) so the
+                        // back button still goes to where it should.
+                        try {
+                            var u = new URL(window.location.href);
+                            if (view === 'list') {
+                                u.searchParams.delete('display');
+                            } else {
+                                u.searchParams.set('display', view);
+                            }
+                            // When leaving calendar view, clean up its params.
+                            if (view !== 'calendar') {
+                                u.searchParams.delete('month');
+                                u.searchParams.delete('cmms_day');
+                            }
+                            window.history.replaceState({}, '', u.toString());
+                        } catch (e) {}
+                    });
+                });
+
+                // 1.14.81.1: URL param wins over localStorage. This is
+                // the key fix for the broken month-navigation chevrons.
+                // When the user clicks ‹ or › in the calendar header,
+                // the page reloads with ?display=calendar&month=2026-04.
+                // Without this URL check we'd fall back to whatever was
+                // last saved (e.g. "list") and the calendar would be
+                // hidden, making it look like the navigation "didn't
+                // work" — when in fact the data was reloaded but the
+                // wrong pane was shown.
+                function getUrlParam(name) {
+                    var match = window.location.search.match(new RegExp('[?&]' + name + '=([^&]*)'));
+                    return match ? decodeURIComponent(match[1]) : null;
+                }
+                var urlDisplay = getUrlParam('display');
+                if (urlDisplay === 'calendar' || urlDisplay === 'kanban' || urlDisplay === 'list') {
+                    apply(urlDisplay);
+                } else {
+                    // Fall back to localStorage.
+                    try {
+                        var saved = localStorage.getItem(KEY);
+                        if (saved === 'kanban' || saved === 'calendar') apply(saved);
+                    } catch (e) {}
+                }
+            })();
+            </script>
         <?php endif; ?>
         <?php
     }
@@ -4036,6 +6170,30 @@ body {
                         <?php CMMS_Icons::e( 'edit', 16 ); ?> <?php $this->e( 'common.edit' ); ?>
                     </a>
                 <?php endif; ?>
+                <?php
+                // 1.14.83: Delete button — permission rules:
+                //   - Owner / Manager: always
+                //   - Technician: only if they CREATED this task
+                //   - Reporter: never
+                $can_delete = false;
+                if ( in_array( $u->role, array( CMMS_Auth::ROLE_OWNER, CMMS_Auth::ROLE_MANAGER ), true ) ) {
+                    $can_delete = true;
+                } elseif ( $u->role === CMMS_Auth::ROLE_TECHNICIAN ) {
+                    $can_delete = ( (int) $task->created_by === (int) $u->id );
+                }
+                if ( $can_delete ) :
+                    $delete_nonce = wp_create_nonce( 'cmms_task_delete' );
+                ?>
+                    <button type="button"
+                            class="cmms-btn cmms-btn-danger-soft"
+                            data-cmms-task-delete
+                            data-task-id="<?php echo (int) $task->id; ?>"
+                            data-task-title="<?php echo esc_attr( $task->title ); ?>"
+                            data-nonce="<?php echo esc_attr( $delete_nonce ); ?>">
+                        <?php CMMS_Icons::e( 'trash-2', 16 ); ?>
+                        <span><?php esc_html_e( 'מחק', 'cmms-light' ); ?></span>
+                    </button>
+                <?php endif; ?>
             </div>
         </div>
 
@@ -4047,12 +6205,27 @@ body {
                         <h3 class="cmms-section-title"><?php CMMS_Icons::e( 'zap', 16 ); ?> <?php $this->e( 'task.quick_status' ); ?></h3>
                     </div>
                     <div class="cmms-section-body">
-                        <form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" class="cmms-flex cmms-gap-2" style="flex-wrap:wrap;">
+                        <form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>"
+                              class="cmms-flex cmms-gap-2"
+                              style="flex-wrap:wrap;"
+                              data-cmms-status-form>
                             <input type="hidden" name="action" value="cmms_task_status">
                             <input type="hidden" name="task_id" value="<?php echo (int) $task->id; ?>">
                             <?php wp_nonce_field( 'cmms_task_status', 'cmms_task_status_nonce' ); ?>
+                            <?php
+                            // 1.14.87: GPS-on-complete fields. Browser
+                            // populates these via the Geolocation API
+                            // before the form submits, when this
+                            // account requires location capture.
+                            $require_gps = CMMS_Task_Settings::require_location_on_complete( (int) $u->account_id );
+                            ?>
+                            <input type="hidden" name="completion_lat"      data-cmms-completion-lat value="">
+                            <input type="hidden" name="completion_lng"      data-cmms-completion-lng value="">
+                            <input type="hidden" name="completion_address"  data-cmms-completion-address value="">
                             <?php foreach ( CMMS_Tasks::statuses() as $k => $v ) : if ( $k === $task->status ) continue; ?>
-                                <button type="submit" name="status" value="<?php echo esc_attr( $k ); ?>" class="cmms-btn cmms-btn-sm">
+                                <button type="submit" name="status" value="<?php echo esc_attr( $k ); ?>"
+                                        class="cmms-btn cmms-btn-sm"
+                                        <?php if ( $require_gps && $k === 'completed' ) echo 'data-cmms-status-needs-gps="1"'; ?>>
                                     <?php echo esc_html( $this->t( 'status.' . $k ) ); ?>
                                 </button>
                             <?php endforeach; ?>
@@ -4070,6 +6243,227 @@ body {
                         <p style="white-space:pre-wrap;margin:0;color:var(--c-text);"><?php echo esc_html( $task->description ); ?></p>
                     </div>
                 </section>
+                <?php endif; ?>
+
+                <?php
+                // 1.14.87: Time & location tracking section. Shows up
+                // when there's anything meaningful to display:
+                //   - timestamps (created/started/completed)
+                //   - durations (response/execution/total)
+                //   - completion location (if captured)
+                // For brand-new tasks (open, never started), only the
+                // created_at is shown.
+                $durations = CMMS_Tasks::calculate_durations( $task );
+                $has_location = ! empty( $task->completion_lat ) && ! empty( $task->completion_lng );
+                ?>
+                <section class="cmms-section">
+                    <div class="cmms-section-head">
+                        <h3 class="cmms-section-title"><?php CMMS_Icons::e( 'clock', 16 ); ?> זמן וביצוע</h3>
+                    </div>
+                    <div class="cmms-section-body">
+                        <div class="cmms-time-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;">
+                            <?php if ( $task->created_at ) : ?>
+                                <div class="cmms-time-cell">
+                                    <div class="cmms-time-label" style="font-size:12px;color:var(--c-muted);">🟡 נפתחה</div>
+                                    <div class="cmms-time-value" style="font-weight:600;color:var(--c-text);">
+                                        <?php echo esc_html( mysql2date( 'd/m/Y H:i', $task->created_at ) ); ?>
+                                    </div>
+                                </div>
+                            <?php endif; ?>
+                            <?php if ( $task->started_at ) : ?>
+                                <div class="cmms-time-cell">
+                                    <div class="cmms-time-label" style="font-size:12px;color:var(--c-muted);">🟠 בטיפול מ-</div>
+                                    <div class="cmms-time-value" style="font-weight:600;color:var(--c-text);">
+                                        <?php echo esc_html( mysql2date( 'd/m/Y H:i', $task->started_at ) ); ?>
+                                    </div>
+                                    <?php if ( $durations['response_seconds'] !== null ) : ?>
+                                        <div class="cmms-time-meta" style="font-size:11px;color:var(--c-muted);margin-top:2px;">
+                                            זמן תגובה: <?php echo esc_html( CMMS_Tasks::format_duration( $durations['response_seconds'] ) ); ?>
+                                        </div>
+                                    <?php endif; ?>
+                                </div>
+                            <?php endif; ?>
+                            <?php if ( $task->completed_at ) : ?>
+                                <div class="cmms-time-cell">
+                                    <div class="cmms-time-label" style="font-size:12px;color:var(--c-muted);">🟢 הושלמה</div>
+                                    <div class="cmms-time-value" style="font-weight:600;color:var(--c-text);">
+                                        <?php echo esc_html( mysql2date( 'd/m/Y H:i', $task->completed_at ) ); ?>
+                                    </div>
+                                </div>
+                            <?php endif; ?>
+                            <?php if ( $durations['execution_seconds'] !== null ) : ?>
+                                <div class="cmms-time-cell" style="background:#f0fdf4;padding:10px 12px;border-radius:8px;border:1px solid #86efac;">
+                                    <div class="cmms-time-label" style="font-size:12px;color:#16a34a;">⏱ זמן ביצוע נטו</div>
+                                    <div class="cmms-time-value" style="font-weight:700;color:#15803d;font-size:15px;">
+                                        <?php echo esc_html( CMMS_Tasks::format_duration( $durations['execution_seconds'] ) ); ?>
+                                    </div>
+                                </div>
+                            <?php endif; ?>
+                        </div>
+
+                        <?php if ( $has_location ) : ?>
+                            <div style="margin-top:18px;padding:12px;background:#eff6ff;border-radius:8px;border:1px solid #bfdbfe;">
+                                <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+                                    <span style="font-size:18px;">📍</span>
+                                    <strong style="color:#1e40af;font-size:13px;">מיקום סגירת המשימה</strong>
+                                    <?php if ( ! empty( $task->completion_location_source ) ) : ?>
+                                        <span style="font-size:11px;color:#3b82f6;margin-inline-start:auto;">
+                                            <?php
+                                            $src_label = array( 'browser' => 'דפדפן', 'telegram' => 'טלגרם', 'manual' => 'ידני' );
+                                            echo esc_html( $src_label[ $task->completion_location_source ] ?? $task->completion_location_source );
+                                            ?>
+                                        </span>
+                                    <?php endif; ?>
+                                </div>
+                                <?php if ( ! empty( $task->completion_address ) ) : ?>
+                                    <div style="font-size:13px;color:#1e3a8a;margin-bottom:6px;padding-inline-start:26px;">
+                                        <?php echo esc_html( $task->completion_address ); ?>
+                                    </div>
+                                <?php endif; ?>
+                                <div style="padding-inline-start:26px;">
+                                    <a href="https://www.google.com/maps/search/?api=1&query=<?php echo (float) $task->completion_lat; ?>,<?php echo (float) $task->completion_lng; ?>"
+                                       target="_blank"
+                                       rel="noopener"
+                                       style="display:inline-flex;align-items:center;gap:4px;color:#2563eb;font-size:13px;font-weight:600;text-decoration:none;">
+                                        🗺️ פתח ב-Google Maps
+                                    </a>
+                                    <span style="font-size:11px;color:#6b7280;margin-inline-start:12px;">
+                                        <?php echo esc_html( number_format( (float) $task->completion_lat, 5 ) ); ?>,
+                                        <?php echo esc_html( number_format( (float) $task->completion_lng, 5 ) ); ?>
+                                    </span>
+                                </div>
+                            </div>
+                        <?php elseif ( $task->status === 'completed' && CMMS_Task_Settings::require_location_on_complete( (int) $u->account_id ) ) : ?>
+                            <div style="margin-top:18px;padding:12px;background:#fef3c7;border-radius:8px;border:1px solid #fbbf24;">
+                                <div style="display:flex;align-items:center;gap:8px;font-size:13px;color:#92400e;">
+                                    <span>⚠️</span>
+                                    <span>המשימה נסגרה ללא מיקום</span>
+                                </div>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                </section>
+
+                <?php
+                // 1.14.87: GPS capture JS. Only loaded if the account
+                // requires GPS-on-complete. Hooks the status form,
+                // intercepts "complete" submits, asks for geo location,
+                // and reverse-geocodes via the browser's built-in
+                // PositionAddress (best-effort).
+                if ( CMMS_Task_Settings::require_location_on_complete( (int) $u->account_id ) ) : ?>
+                <script>
+                (function () {
+                    'use strict';
+                    var form = document.querySelector('[data-cmms-status-form]');
+                    if (!form) return;
+                    var latIn  = form.querySelector('[data-cmms-completion-lat]');
+                    var lngIn  = form.querySelector('[data-cmms-completion-lng]');
+                    var addrIn = form.querySelector('[data-cmms-completion-address]');
+
+                    var DEBUG = true; // 1.14.87.2: temporary debug logging
+                    function log(msg) {
+                        if (DEBUG && window.console) console.log('[CMMS GPS]', msg);
+                    }
+
+                    // Track if we already injected the GPS, so we don't loop.
+                    var gpsInjected = false;
+                    var submitterStatus = null;
+                    var watchdogTimer = null;
+
+                    // Capture which button was actually clicked.
+                    form.querySelectorAll('button[type=submit]').forEach(function (btn) {
+                        btn.addEventListener('click', function () {
+                            submitterStatus = btn.value;
+                            log('Button clicked, status=' + submitterStatus);
+                        });
+                    });
+
+                    // Helper: programmatically submit the form WITH the
+                    // status value of the button that was clicked.
+                    function submitWithStatus(status) {
+                        log('submitWithStatus(' + status + ')');
+                        if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null; }
+                        var statusInput = form.querySelector('input[type=hidden][name=status]');
+                        if (!statusInput) {
+                            statusInput = document.createElement('input');
+                            statusInput.type = 'hidden';
+                            statusInput.name = 'status';
+                            form.appendChild(statusInput);
+                        }
+                        statusInput.value = status;
+                        gpsInjected = true;
+                        form.submit();
+                    }
+
+                    function restoreButton(btn) {
+                        if (!btn) return;
+                        btn.disabled = false;
+                        if (btn.dataset.origText) btn.textContent = btn.dataset.origText;
+                    }
+
+                    function askWithoutLocation(btn) {
+                        var ok = window.confirm(
+                            'לא ניתן לקבל את המיקום שלך.\n\n' +
+                            'האם להמשיך בסגירת המשימה ללא מיקום?'
+                        );
+                        restoreButton(btn);
+                        if (ok) submitWithStatus('completed');
+                    }
+
+                    form.addEventListener('submit', function (e) {
+                        log('submit fired, submitterStatus=' + submitterStatus + ', gpsInjected=' + gpsInjected);
+
+                        // Only intercept the "completed" submit, and only once.
+                        if (submitterStatus !== 'completed' || gpsInjected) {
+                            log('Allow submit through (not completed or already injected)');
+                            return;
+                        }
+
+                        // No geolocation API? Just submit as-is.
+                        if (!('geolocation' in navigator)) {
+                            log('No geolocation API — submitting without');
+                            return;
+                        }
+
+                        e.preventDefault();
+                        log('Intercepted submit; asking for GPS...');
+
+                        var btn = form.querySelector('button[value="completed"]');
+                        if (btn) {
+                            btn.disabled = true;
+                            btn.dataset.origText = btn.textContent;
+                            btn.textContent = '📍 מקבל מיקום...';
+                        }
+
+                        // 1.14.87.1 bugfix: watchdog. Some browsers
+                        // never call success OR error if GPS hangs.
+                        // After 20s, fall back to "complete without
+                        // location?" confirm dialog.
+                        watchdogTimer = setTimeout(function () {
+                            log('Watchdog fired — GPS never returned');
+                            watchdogTimer = null;
+                            askWithoutLocation(btn);
+                        }, 20000);
+
+                        navigator.geolocation.getCurrentPosition(function (pos) {
+                            log('GPS success: ' + pos.coords.latitude + ', ' + pos.coords.longitude);
+                            if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null; }
+                            latIn.value = pos.coords.latitude.toFixed(7);
+                            lngIn.value = pos.coords.longitude.toFixed(7);
+                            addrIn.value = '';
+                            submitWithStatus('completed');
+                        }, function (err) {
+                            log('GPS error: code=' + err.code + ' msg=' + err.message);
+                            if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null; }
+                            askWithoutLocation(btn);
+                        }, {
+                            enableHighAccuracy: true,
+                            timeout: 15000,
+                            maximumAge: 60000
+                        });
+                    });
+                })();
+                </script>
                 <?php endif; ?>
 
                 <section class="cmms-section">
@@ -4104,6 +6498,434 @@ body {
                         </form>
                     </div>
                 </section>
+
+                <?php
+                // 1.15.3: Signatures section. Shows existing signatures
+                // (customer + technician) and offers a button to capture
+                // a new one via a modal canvas.
+                $signatures = CMMS_Signatures::list_for_task( $task->id );
+                $can_sign = $can_status; // Same permission as participating
+                ?>
+                <section class="cmms-section">
+                    <div class="cmms-section-head">
+                        <h3 class="cmms-section-title">
+                            <?php CMMS_Icons::e( 'edit-3', 16 ); ?>
+                            <?php esc_html_e( 'חתימות', 'cmms-light' ); ?>
+                            <?php if ( ! empty( $signatures ) ) : ?>
+                                <span style="font-size:11px;color:#64748b;font-weight:normal;">(<?php echo count( $signatures ); ?>)</span>
+                            <?php endif; ?>
+                        </h3>
+                    </div>
+                    <div class="cmms-section-body">
+                        <p style="font-size:12px;color:#64748b;margin:0 0 12px;">
+                            <?php esc_html_e( 'איסוף חתימה של לקוח או טכנאי כעדות שהעבודה בוצעה.', 'cmms-light' ); ?>
+                        </p>
+
+                        <?php if ( empty( $signatures ) ) : ?>
+                            <div style="background:#f8fafc;border:1px dashed #cbd5e1;border-radius:8px;padding:20px;text-align:center;color:#64748b;font-size:12px;margin-bottom:12px;">
+                                <?php esc_html_e( 'עדיין לא נאספו חתימות במשימה זו.', 'cmms-light' ); ?>
+                            </div>
+                        <?php else : ?>
+                            <div class="cmms-signatures-list" style="display:flex;flex-direction:column;gap:10px;margin-bottom:12px;">
+                                <?php foreach ( $signatures as $sig ) :
+                                    $type_label = $sig->signer_type === CMMS_Signatures::TYPE_TECHNICIAN
+                                        ? __( 'חתימת טכנאי', 'cmms-light' )
+                                        : __( 'חתימת לקוח', 'cmms-light' );
+                                    $type_color = $sig->signer_type === CMMS_Signatures::TYPE_TECHNICIAN
+                                        ? '#0369a1'
+                                        : '#15803d';
+                                ?>
+                                    <div class="cmms-signature-card"
+                                         data-signature-id="<?php echo (int) $sig->id; ?>"
+                                         style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:12px;">
+                                        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;gap:8px;flex-wrap:wrap;">
+                                            <div>
+                                                <span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600;background:<?php echo esc_attr( $type_color ); ?>;color:#fff;">
+                                                    <?php echo esc_html( $type_label ); ?>
+                                                </span>
+                                                <div style="margin-top:6px;font-weight:600;font-size:13px;color:#0f172a;">
+                                                    <?php echo esc_html( $sig->signer_name ); ?>
+                                                </div>
+                                                <?php if ( $sig->signer_role ) : ?>
+                                                    <div style="font-size:11px;color:#64748b;">
+                                                        <?php echo esc_html( $sig->signer_role ); ?>
+                                                    </div>
+                                                <?php endif; ?>
+                                                <div style="font-size:10px;color:#94a3b8;margin-top:4px;">
+                                                    <?php echo esc_html( mysql2date( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ), $sig->signed_at ) ); ?>
+                                                    <?php if ( $sig->signed_ip ) : ?>
+                                                        · IP: <?php echo esc_html( $sig->signed_ip ); ?>
+                                                    <?php endif; ?>
+                                                </div>
+                                            </div>
+                                            <?php if ( $can_sign ) : ?>
+                                                <button type="button"
+                                                        class="cmms-btn cmms-btn-sm cmms-btn-ghost cmms-signature-delete-btn"
+                                                        data-signature-id="<?php echo (int) $sig->id; ?>"
+                                                        style="color:#b91c1c;font-size:11px;padding:4px 8px;">
+                                                    🗑
+                                                </button>
+                                            <?php endif; ?>
+                                        </div>
+                                        <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:8px;text-align:center;">
+                                            <img src="<?php echo esc_attr( $sig->signature_data ); ?>"
+                                                 alt="<?php echo esc_attr( $sig->signer_name ); ?>"
+                                                 style="max-width:100%;max-height:120px;object-fit:contain;">
+                                        </div>
+                                    </div>
+                                <?php endforeach; ?>
+                            </div>
+                        <?php endif; ?>
+
+                        <?php if ( $can_sign ) : ?>
+                            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                                <button type="button"
+                                        class="cmms-btn cmms-btn-primary cmms-signature-open-btn"
+                                        data-signer-type="customer"
+                                        data-task-id="<?php echo (int) $task->id; ?>"
+                                        style="flex:1;min-width:140px;">
+                                    👤 <?php esc_html_e( 'החתמת לקוח', 'cmms-light' ); ?>
+                                </button>
+                                <button type="button"
+                                        class="cmms-btn cmms-btn-secondary cmms-signature-open-btn"
+                                        data-signer-type="technician"
+                                        data-task-id="<?php echo (int) $task->id; ?>"
+                                        style="flex:1;min-width:140px;">
+                                    🔧 <?php esc_html_e( 'חתימת טכנאי', 'cmms-light' ); ?>
+                                </button>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                </section>
+
+                <?php
+                // Signature capture modal — hidden by default, opened
+                // by the buttons above. Single modal handles both types
+                // (customer/technician); the trigger button passes the
+                // type via data-signer-type.
+                if ( $can_sign ) :
+                    $add_nonce    = wp_create_nonce( 'cmms_signature_add' );
+                    $delete_nonce = wp_create_nonce( 'cmms_signature_delete' );
+                ?>
+                <div class="cmms-signature-modal" style="display:none;position:fixed;inset:0;background:rgba(15,23,42,0.6);z-index:9999;align-items:center;justify-content:center;padding:16px;">
+                    <div style="background:#fff;border-radius:12px;max-width:520px;width:100%;max-height:90vh;overflow-y:auto;padding:20px;box-shadow:0 20px 50px rgba(0,0,0,0.3);">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+                            <h3 style="margin:0;font-size:18px;color:#0f172a;" class="cmms-signature-modal-title">
+                                <?php esc_html_e( 'איסוף חתימה', 'cmms-light' ); ?>
+                            </h3>
+                            <button type="button" class="cmms-signature-close-btn"
+                                    style="background:none;border:none;font-size:20px;cursor:pointer;color:#64748b;padding:0;width:28px;height:28px;">✕</button>
+                        </div>
+
+                        <div class="cmms-field cmms-mb-3">
+                            <label class="cmms-field-label">
+                                <?php esc_html_e( 'שם מלא', 'cmms-light' ); ?> <span style="color:#dc2626;">*</span>
+                            </label>
+                            <input type="text" class="cmms-input cmms-signature-name" placeholder="<?php esc_attr_e( 'לדוגמה: ישראל ישראלי', 'cmms-light' ); ?>" required>
+                        </div>
+
+                        <div class="cmms-field cmms-mb-3">
+                            <label class="cmms-field-label">
+                                <?php esc_html_e( 'תפקיד / חברה (אופציונלי)', 'cmms-light' ); ?>
+                            </label>
+                            <input type="text" class="cmms-input cmms-signature-role" placeholder="<?php esc_attr_e( 'לדוגמה: מנהל אחזקה / חברת אבק נכסים', 'cmms-light' ); ?>">
+                        </div>
+
+                        <div class="cmms-field cmms-mb-3">
+                            <label class="cmms-field-label">
+                                <?php esc_html_e( 'חתימה', 'cmms-light' ); ?> <span style="color:#dc2626;">*</span>
+                            </label>
+                            <div style="background:#f8fafc;border:2px dashed #cbd5e1;border-radius:8px;padding:8px;">
+                                <canvas class="cmms-signature-canvas"
+                                        width="800" height="300"
+                                        tabindex="-1"
+                                        style="display:block;width:100%;height:auto;background:#fff;border-radius:4px;cursor:crosshair;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent;"></canvas>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;margin-top:6px;font-size:11px;color:#64748b;">
+                                <span><?php esc_html_e( 'חתום באצבע או בעכבר', 'cmms-light' ); ?></span>
+                                <button type="button" class="cmms-signature-clear-btn"
+                                        style="background:none;border:none;color:#dc2626;cursor:pointer;font-size:11px;text-decoration:underline;">
+                                    <?php esc_html_e( '🗑 נקה ציור', 'cmms-light' ); ?>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="cmms-signature-error" style="display:none;background:#fee2e2;color:#991b1b;border:1px solid #fca5a5;border-radius:6px;padding:8px 10px;font-size:12px;margin-bottom:12px;"></div>
+
+                        <div style="display:flex;gap:8px;">
+                            <button type="button" class="cmms-btn cmms-btn-secondary cmms-signature-close-btn" style="flex:1;">
+                                <?php esc_html_e( 'ביטול', 'cmms-light' ); ?>
+                            </button>
+                            <button type="button" class="cmms-btn cmms-btn-primary cmms-signature-save-btn" style="flex:2;">
+                                ✓ <?php esc_html_e( 'שמור חתימה', 'cmms-light' ); ?>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <script>
+                (function() {
+                    if ( window.__cmmsSignatureBound ) return;
+                    window.__cmmsSignatureBound = true;
+
+                    var ADD_NONCE    = <?php echo wp_json_encode( $add_nonce ); ?>;
+                    var DELETE_NONCE = <?php echo wp_json_encode( $delete_nonce ); ?>;
+                    var AJAX_URL     = <?php echo wp_json_encode( admin_url( 'admin-ajax.php' ) ); ?>;
+                    var TASK_ID      = <?php echo (int) $task->id; ?>;
+
+                    var modal       = document.querySelector('.cmms-signature-modal');
+                    var canvas      = modal ? modal.querySelector('.cmms-signature-canvas') : null;
+                    var nameInput   = modal ? modal.querySelector('.cmms-signature-name')   : null;
+                    var roleInput   = modal ? modal.querySelector('.cmms-signature-role')   : null;
+                    var errorBox    = modal ? modal.querySelector('.cmms-signature-error')  : null;
+                    var titleEl     = modal ? modal.querySelector('.cmms-signature-modal-title') : null;
+
+                    var currentSignerType = 'customer';
+                    var ctx = null;
+                    var isDrawing = false;
+                    var hasDrawn = false;
+                    var lastX = 0, lastY = 0;
+
+                    if ( canvas ) {
+                        ctx = canvas.getContext('2d');
+                        setupCanvas();
+                    }
+
+                    // ── Open modal ──
+                    document.addEventListener('click', function(e) {
+                        var openBtn = e.target.closest('.cmms-signature-open-btn');
+                        if ( openBtn ) {
+                            e.preventDefault();
+                            currentSignerType = openBtn.getAttribute('data-signer-type') || 'customer';
+                            if ( titleEl ) {
+                                titleEl.textContent = currentSignerType === 'technician'
+                                    ? 'חתימת טכנאי'
+                                    : 'איסוף חתימה (לקוח)';
+                            }
+                            // Reset form state
+                            if ( nameInput ) nameInput.value = '';
+                            if ( roleInput ) roleInput.value = '';
+                            if ( errorBox ) errorBox.style.display = 'none';
+                            clearCanvas();
+                            modal.style.display = 'flex';
+                            // Focus name field for fast data entry
+                            setTimeout(function() { if ( nameInput ) nameInput.focus(); }, 100);
+                            return;
+                        }
+
+                        // ── Close modal ──
+                        var closeBtn = e.target.closest('.cmms-signature-close-btn');
+                        if ( closeBtn ) {
+                            e.preventDefault();
+                            modal.style.display = 'none';
+                            return;
+                        }
+
+                        // ── Clear canvas ──
+                        var clearBtn = e.target.closest('.cmms-signature-clear-btn');
+                        if ( clearBtn ) {
+                            e.preventDefault();
+                            clearCanvas();
+                            return;
+                        }
+
+                        // ── Save signature ──
+                        var saveBtn = e.target.closest('.cmms-signature-save-btn');
+                        if ( saveBtn ) {
+                            e.preventDefault();
+                            saveSignature(saveBtn);
+                            return;
+                        }
+
+                        // ── Delete existing signature ──
+                        var deleteBtn = e.target.closest('.cmms-signature-delete-btn');
+                        if ( deleteBtn ) {
+                            e.preventDefault();
+                            if ( ! confirm('למחוק את החתימה? פעולה זו אינה הפיכה.') ) return;
+                            deleteSignature( deleteBtn.getAttribute('data-signature-id'), deleteBtn );
+                            return;
+                        }
+                    });
+
+                    // ── Canvas setup ──
+                    function setupCanvas() {
+                        ctx.lineWidth = 2.5;
+                        ctx.lineCap = 'round';
+                        ctx.lineJoin = 'round';
+                        ctx.strokeStyle = '#0f172a';
+
+                        // Mouse events
+                        canvas.addEventListener('mousedown', function(e) {
+                            startDraw(getCoords(e));
+                        });
+                        canvas.addEventListener('mousemove', function(e) {
+                            if ( isDrawing ) draw(getCoords(e));
+                        });
+                        canvas.addEventListener('mouseup', endDraw);
+                        canvas.addEventListener('mouseleave', endDraw);
+
+                        // Touch events (mobile — the main use case)
+                        canvas.addEventListener('touchstart', function(e) {
+                            e.preventDefault();
+                            startDraw(getCoords(e.touches[0]));
+                        }, { passive: false });
+                        canvas.addEventListener('touchmove', function(e) {
+                            e.preventDefault();
+                            if ( isDrawing ) draw(getCoords(e.touches[0]));
+                        }, { passive: false });
+                        canvas.addEventListener('touchend', function(e) {
+                            e.preventDefault();
+                            endDraw();
+                        }, { passive: false });
+                    }
+
+                    function getCoords(evt) {
+                        var rect = canvas.getBoundingClientRect();
+                        // Translate display coords to canvas coords (the
+                        // canvas is rendered at width:100% but the internal
+                        // resolution is 800x300 — we need to scale).
+                        var scaleX = canvas.width / rect.width;
+                        var scaleY = canvas.height / rect.height;
+                        return {
+                            x: (evt.clientX - rect.left) * scaleX,
+                            y: (evt.clientY - rect.top) * scaleY
+                        };
+                    }
+
+                    function startDraw(coords) {
+                        // Close mobile keyboard if it was open from
+                        // the name/role fields — otherwise it can
+                        // overlap the canvas and prevent signing.
+                        if ( document.activeElement && document.activeElement.blur ) {
+                            document.activeElement.blur();
+                        }
+                        isDrawing = true;
+                        hasDrawn = true;
+                        lastX = coords.x;
+                        lastY = coords.y;
+                        // Draw a dot for taps
+                        ctx.beginPath();
+                        ctx.arc(coords.x, coords.y, 1.3, 0, Math.PI * 2);
+                        ctx.fillStyle = '#0f172a';
+                        ctx.fill();
+                    }
+
+                    function draw(coords) {
+                        ctx.beginPath();
+                        ctx.moveTo(lastX, lastY);
+                        ctx.lineTo(coords.x, coords.y);
+                        ctx.stroke();
+                        lastX = coords.x;
+                        lastY = coords.y;
+                    }
+
+                    function endDraw() {
+                        isDrawing = false;
+                    }
+
+                    function clearCanvas() {
+                        ctx.fillStyle = '#fff';
+                        ctx.fillRect(0, 0, canvas.width, canvas.height);
+                        ctx.strokeStyle = '#0f172a';
+                        hasDrawn = false;
+                    }
+
+                    function showError(msg) {
+                        if ( ! errorBox ) return;
+                        errorBox.textContent = msg;
+                        errorBox.style.display = 'block';
+                    }
+
+                    function hideError() {
+                        if ( errorBox ) errorBox.style.display = 'none';
+                    }
+
+                    // ── Save signature via AJAX ──
+                    function saveSignature(btn) {
+                        hideError();
+
+                        var name = (nameInput.value || '').trim();
+                        if ( ! name ) {
+                            showError('יש למלא שם מלא של החותם');
+                            nameInput.focus();
+                            return;
+                        }
+                        if ( ! hasDrawn ) {
+                            showError('יש לחתום על האזור המסומן לפני שמירה');
+                            return;
+                        }
+
+                        var dataUrl = canvas.toDataURL('image/png');
+
+                        var originalText = btn.innerHTML;
+                        btn.disabled = true;
+                        btn.innerHTML = 'שומר...';
+
+                        var formData = new FormData();
+                        formData.append('action', 'cmms_signature_add');
+                        formData.append('_wpnonce', ADD_NONCE);
+                        formData.append('task_id', TASK_ID);
+                        formData.append('signer_type', currentSignerType);
+                        formData.append('signer_name', name);
+                        formData.append('signer_role', (roleInput.value || '').trim());
+                        formData.append('signature_data', dataUrl);
+
+                        fetch(AJAX_URL, {
+                            method: 'POST',
+                            credentials: 'same-origin',
+                            body: formData
+                        }).then(function(r) { return r.json(); }).then(function(json) {
+                            if ( json && json.success ) {
+                                // Reload page to show the new signature
+                                // properly (with all its metadata, log
+                                // entries, etc).
+                                location.reload();
+                            } else {
+                                var msg = (json && json.data && json.data.message) || 'שגיאה לא ידועה';
+                                showError(msg);
+                            }
+                        }).catch(function() {
+                            showError('שגיאת רשת - אנא נסה שוב');
+                        }).finally(function() {
+                            btn.disabled = false;
+                            btn.innerHTML = originalText;
+                        });
+                    }
+
+                    // ── Delete signature via AJAX ──
+                    function deleteSignature(sigId, btn) {
+                        var originalText = btn.innerHTML;
+                        btn.disabled = true;
+                        btn.innerHTML = '...';
+
+                        var formData = new FormData();
+                        formData.append('action', 'cmms_signature_delete');
+                        formData.append('_wpnonce', DELETE_NONCE);
+                        formData.append('signature_id', sigId);
+
+                        fetch(AJAX_URL, {
+                            method: 'POST',
+                            credentials: 'same-origin',
+                            body: formData
+                        }).then(function(r) { return r.json(); }).then(function(json) {
+                            if ( json && json.success ) {
+                                // Remove the card from the DOM
+                                var card = btn.closest('.cmms-signature-card');
+                                if ( card ) card.remove();
+                            } else {
+                                alert('שגיאה במחיקה: ' + ((json && json.data && json.data.message) || 'לא ידוע'));
+                                btn.disabled = false;
+                                btn.innerHTML = originalText;
+                            }
+                        }).catch(function() {
+                            alert('שגיאת רשת');
+                            btn.disabled = false;
+                            btn.innerHTML = originalText;
+                        });
+                    }
+                })();
+                </script>
+                <?php endif; // can_sign for modal ?>
 
                 <section class="cmms-section">
                     <div class="cmms-section-head">
@@ -4198,6 +7020,183 @@ body {
                 </section>
             </aside>
         </div>
+
+        <?php // 1.14.83: Delete button handler + modal styling.
+              // Self-contained — no global JS dependencies. ?>
+        <style>
+        .cmms-btn-danger-soft {
+            background: #fef2f2;
+            color: #b91c1c;
+            border: 1px solid #fecaca;
+        }
+        .cmms-btn-danger-soft:hover {
+            background: #fee2e2;
+            border-color: #fca5a5;
+            color: #991b1b;
+        }
+        .cmms-task-delete-modal {
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.55);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 10000;
+            padding: 16px;
+        }
+        .cmms-task-delete-modal.is-open { display: flex; }
+        .cmms-task-delete-card {
+            background: white;
+            border-radius: 14px;
+            max-width: 460px;
+            width: 100%;
+            padding: 24px;
+            box-shadow: 0 24px 48px rgba(0,0,0,0.2);
+            direction: rtl;
+        }
+        .cmms-task-delete-icon {
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            background: #fee2e2;
+            color: #b91c1c;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 22px;
+            margin-bottom: 14px;
+        }
+        .cmms-task-delete-title {
+            font-size: 18px;
+            font-weight: 700;
+            color: #0f172a;
+            margin: 0 0 8px;
+        }
+        .cmms-task-delete-body {
+            font-size: 14px;
+            color: #475569;
+            line-height: 1.6;
+            margin-bottom: 6px;
+        }
+        .cmms-task-delete-task-name {
+            font-weight: 600;
+            color: #0f172a;
+            background: #f1f5f9;
+            padding: 2px 8px;
+            border-radius: 6px;
+            display: inline-block;
+            margin: 6px 0;
+            word-break: break-word;
+        }
+        .cmms-task-delete-note {
+            font-size: 12px;
+            color: #64748b;
+            background: #f8fafc;
+            border-right: 3px solid #cbd5e1;
+            padding: 10px 12px;
+            border-radius: 6px;
+            margin: 16px 0;
+        }
+        .cmms-task-delete-actions {
+            display: flex;
+            gap: 8px;
+            justify-content: flex-end;
+            margin-top: 20px;
+        }
+        .cmms-task-delete-actions .cmms-btn { min-height: 40px; }
+        @media (max-width: 480px) {
+            .cmms-task-delete-card { padding: 20px; }
+            .cmms-task-delete-actions { flex-direction: column-reverse; }
+            .cmms-task-delete-actions .cmms-btn { width: 100%; justify-content: center; }
+        }
+        </style>
+
+        <div class="cmms-task-delete-modal" data-cmms-task-delete-modal role="dialog" aria-modal="true" aria-labelledby="cmms-task-delete-title">
+            <div class="cmms-task-delete-card">
+                <div class="cmms-task-delete-icon">🗑</div>
+                <h3 class="cmms-task-delete-title" id="cmms-task-delete-title"><?php esc_html_e( 'מחיקת משימה', 'cmms-light' ); ?></h3>
+                <p class="cmms-task-delete-body">
+                    <?php esc_html_e( 'האם למחוק את המשימה?', 'cmms-light' ); ?>
+                </p>
+                <div class="cmms-task-delete-task-name" data-cmms-task-delete-name></div>
+                <div class="cmms-task-delete-note">
+                    <?php esc_html_e( 'המשימה תוסר מהרשימות, אך תישמר במערכת לצורך שחזור ובקרה.', 'cmms-light' ); ?>
+                </div>
+                <div class="cmms-task-delete-actions">
+                    <button type="button" class="cmms-btn" data-cmms-task-delete-cancel><?php esc_html_e( 'ביטול', 'cmms-light' ); ?></button>
+                    <button type="button" class="cmms-btn cmms-btn-danger-soft" data-cmms-task-delete-confirm>
+                        <?php CMMS_Icons::e( 'trash-2', 16 ); ?>
+                        <span><?php esc_html_e( 'מחק משימה', 'cmms-light' ); ?></span>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <script>
+        (function () {
+            'use strict';
+            var trigger = document.querySelector('[data-cmms-task-delete]');
+            var modal   = document.querySelector('[data-cmms-task-delete-modal]');
+            if (!trigger || !modal) return;
+
+            var nameEl    = modal.querySelector('[data-cmms-task-delete-name]');
+            var cancelBtn = modal.querySelector('[data-cmms-task-delete-cancel]');
+            var confirmBtn = modal.querySelector('[data-cmms-task-delete-confirm]');
+
+            var AJAX_URL  = <?php echo wp_json_encode( admin_url( 'admin-ajax.php' ) ); ?>;
+            var TASKS_URL = <?php echo wp_json_encode( $this->url( array( 'view' => 'tasks' ) ) ); ?>;
+
+            function openModal() {
+                nameEl.textContent = trigger.getAttribute('data-task-title') || '';
+                modal.classList.add('is-open');
+            }
+            function closeModal() {
+                modal.classList.remove('is-open');
+            }
+
+            trigger.addEventListener('click', openModal);
+            cancelBtn.addEventListener('click', closeModal);
+
+            // Click outside the card closes.
+            modal.addEventListener('click', function (e) {
+                if (e.target === modal) closeModal();
+            });
+            document.addEventListener('keydown', function (e) {
+                if (e.key === 'Escape' && modal.classList.contains('is-open')) closeModal();
+            });
+
+            confirmBtn.addEventListener('click', function () {
+                confirmBtn.disabled = true;
+                cancelBtn.disabled = true;
+                var body = new URLSearchParams();
+                body.set('action',  'cmms_task_delete');
+                body.set('nonce',   trigger.getAttribute('data-nonce'));
+                body.set('task_id', trigger.getAttribute('data-task-id'));
+                fetch(AJAX_URL, {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: body.toString()
+                }).then(function (r) { return r.json().catch(function () { return null; }); })
+                  .then(function (res) {
+                      if (res && res.success) {
+                          // Navigate back to the task list — the deleted
+                          // task won't appear there anymore.
+                          window.location.href = TASKS_URL;
+                      } else {
+                          var msg = (res && res.data && res.data.message) ? res.data.message : 'מחיקת המשימה נכשלה';
+                          alert(msg);
+                          confirmBtn.disabled = false;
+                          cancelBtn.disabled = false;
+                      }
+                  }).catch(function () {
+                      alert('שגיאת רשת');
+                      confirmBtn.disabled = false;
+                      cancelBtn.disabled = false;
+                  });
+            });
+        })();
+        </script>
         <?php
     }
 
@@ -4406,17 +7405,18 @@ body {
         $is_priv = in_array( $u->role, array( CMMS_Auth::ROLE_OWNER, CMMS_Auth::ROLE_MANAGER ), true );
         if ( $is_priv ) {
             $tasks = $wpdb->get_results( $wpdb->prepare(
-                "SELECT * FROM $t_tasks WHERE asset_id = %d AND account_id = %d ORDER BY created_at DESC LIMIT 20",
+                "SELECT * FROM $t_tasks WHERE asset_id = %d AND account_id = %d AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 20",
                 $asset->id, $u->account_id
             ) );
             $task_count_total = (int) $wpdb->get_var( $wpdb->prepare(
-                "SELECT COUNT(*) FROM $t_tasks WHERE asset_id = %d AND account_id = %d",
+                "SELECT COUNT(*) FROM $t_tasks WHERE asset_id = %d AND account_id = %d AND deleted_at IS NULL",
                 $asset->id, $u->account_id
             ) );
         } else {
             $tasks = $wpdb->get_results( $wpdb->prepare(
                 "SELECT * FROM $t_tasks
                   WHERE asset_id = %d AND account_id = %d
+                    AND deleted_at IS NULL
                     AND ( assigned_to = %d OR manager_id = %d OR created_by = %d )
                   ORDER BY created_at DESC LIMIT 20",
                 $asset->id, $u->account_id, $u->id, $u->id, $u->id
@@ -4424,6 +7424,7 @@ body {
             $task_count_total = (int) $wpdb->get_var( $wpdb->prepare(
                 "SELECT COUNT(*) FROM $t_tasks
                   WHERE asset_id = %d AND account_id = %d
+                    AND deleted_at IS NULL
                     AND ( assigned_to = %d OR manager_id = %d OR created_by = %d )",
                 $asset->id, $u->account_id, $u->id, $u->id, $u->id
             ) );
@@ -4626,22 +7627,2036 @@ body {
 
         <!-- Task history -->
         <section class="cmms-section" id="cmms-asset-tasks">
-            <div class="cmms-section-head">
+            <div class="cmms-section-head" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
                 <h3 class="cmms-section-title"><?php CMMS_Icons::e( 'list', 16 ); ?> <?php $this->e( 'asset.tasks' ); ?></h3>
-                <?php if ( $task_count_total > count( $tasks ) ) : ?>
-                    <span class="cmms-muted cmms-text-sm"><?php echo esc_html( sprintf( $this->t( 'asset.tasks_showing' ), count( $tasks ), $task_count_total ) ); ?></span>
-                <?php endif; ?>
+                <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                    <?php if ( $task_count_total > count( $tasks ) ) : ?>
+                        <span class="cmms-muted cmms-text-sm"><?php echo esc_html( sprintf( $this->t( 'asset.tasks_showing' ), count( $tasks ), $task_count_total ) ); ?></span>
+                    <?php endif; ?>
+                    <?php // 1.14.76 — View toggle. Default = list (existing behavior).
+                          // The toggle is rendered only when there's at least one task.
+                          if ( ! empty( $tasks ) ) : ?>
+                    <div class="cmms-asset-tasks-toggle" role="tablist" aria-label="<?php esc_attr_e( 'תצוגת משימות', 'cmms-light' ); ?>">
+                        <button type="button"
+                                class="cmms-asset-tasks-toggle-btn is-active"
+                                data-asset-view="list"
+                                role="tab"
+                                aria-selected="true">
+                            <?php esc_html_e( '📋 רשימה', 'cmms-light' ); ?>
+                        </button>
+                        <button type="button"
+                                class="cmms-asset-tasks-toggle-btn"
+                                data-asset-view="gantt"
+                                role="tab"
+                                aria-selected="false">
+                            <?php esc_html_e( '📊 גאנט', 'cmms-light' ); ?>
+                        </button>
+                        <button type="button"
+                                class="cmms-asset-tasks-toggle-btn"
+                                data-asset-view="kanban"
+                                role="tab"
+                                aria-selected="false">
+                            <?php esc_html_e( '🗂 Kanban', 'cmms-light' ); ?>
+                        </button>
+                    </div>
+                    <?php endif; ?>
+                </div>
             </div>
             <div class="cmms-section-body">
                 <?php if ( empty( $tasks ) ) : ?>
                     <p class="cmms-muted cmms-text-sm" style="margin:0;"><?php $this->e( 'asset.no_tasks' ); ?></p>
                 <?php else : ?>
-                    <div class="cmms-list">
+                    <!-- 1.14.76: List view (the existing rendering, unchanged). -->
+                    <div class="cmms-list cmms-asset-tasks-list" data-asset-view-pane="list">
                         <?php foreach ( $tasks as $task ) $this->task_card( $task, $u ); ?>
+                    </div>
+                    <?php $this->inline_status_changer_assets(); ?>
+
+                    <!-- 1.14.76: Gantt view, hidden by default. -->
+                    <div class="cmms-asset-tasks-gantt" data-asset-view-pane="gantt" hidden>
+                        <?php $this->render_asset_tasks_gantt( $tasks, $u ); ?>
+                    </div>
+
+                    <!-- 1.14.77: Kanban view, hidden by default. -->
+                    <div class="cmms-asset-tasks-kanban" data-asset-view-pane="kanban" hidden>
+                        <?php
+                        // Use a per-asset instance id so multiple boards on
+                        // the same page (Tasks + per-asset) get unique DOMs.
+                        $asset_id_for_instance = isset( $asset->id ) ? (int) $asset->id : 0;
+                        $this->render_kanban_board( $tasks, $u, 'asset-' . $asset_id_for_instance );
+                        ?>
                     </div>
                 <?php endif; ?>
             </div>
         </section>
+
+        <?php // 1.14.76 — Inline CSS + JS for the view toggle + Gantt.
+              // Scoped to .cmms-asset-tasks-* so nothing leaks to other pages.
+              // Only emitted when there are tasks. ?>
+        <?php if ( ! empty( $tasks ) ) : ?>
+        <style>
+        /* ─── Toggle (list / gantt) ─── */
+        .cmms-asset-tasks-toggle {
+            display: inline-flex;
+            background: #eef2f7;
+            border-radius: 8px;
+            padding: 3px;
+            gap: 0;
+        }
+        .cmms-asset-tasks-toggle-btn {
+            border: 0;
+            background: transparent;
+            color: #64748b;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background .15s ease, color .15s ease;
+            font-family: inherit;
+        }
+        .cmms-asset-tasks-toggle-btn:hover { color: #0f172a; }
+        .cmms-asset-tasks-toggle-btn.is-active {
+            background: #fff;
+            color: #0f172a;
+            box-shadow: 0 1px 2px rgba(15,23,42,.08);
+        }
+
+        /* ─── Gantt chart ─── */
+        .cmms-gantt {
+            background: #fff;
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        .cmms-gantt-scroll {
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+        .cmms-gantt-inner {
+            position: relative;
+            min-width: 100%;
+        }
+        .cmms-gantt-header {
+            display: flex;
+            border-bottom: 1px solid #e2e8f0;
+            background: #f8fafc;
+        }
+        .cmms-gantt-header-labels {
+            flex: none;
+            width: 200px;
+            padding: 10px 14px;
+            font-size: 12px;
+            font-weight: 600;
+            color: #64748b;
+            border-inline-end: 1px solid #e2e8f0;
+            position: sticky;
+            inset-inline-start: 0;
+            background: #f8fafc;
+            z-index: 2;
+        }
+        .cmms-gantt-header-timeline {
+            flex: 1;
+            position: relative;
+            min-width: 600px;
+        }
+        .cmms-gantt-tick {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            border-inline-start: 1px solid #e2e8f0;
+            padding: 10px 6px 0;
+            font-size: 11px;
+            color: #94a3b8;
+            white-space: nowrap;
+        }
+        .cmms-gantt-row {
+            display: flex;
+            border-bottom: 1px solid #f1f5f9;
+            min-height: 44px;
+        }
+        .cmms-gantt-row:last-child { border-bottom: 0; }
+        .cmms-gantt-row:hover .cmms-gantt-row-label { background: #f8fafc; }
+        .cmms-gantt-row-label {
+            flex: none;
+            width: 200px;
+            padding: 10px 14px;
+            font-size: 13px;
+            color: #0f172a;
+            border-inline-end: 1px solid #e2e8f0;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            position: sticky;
+            inset-inline-start: 0;
+            background: #fff;
+            z-index: 1;
+            min-width: 0;
+        }
+        .cmms-gantt-row-label-text {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            font-weight: 500;
+            min-width: 0;
+        }
+        .cmms-gantt-row-track {
+            flex: 1;
+            position: relative;
+            min-width: 600px;
+        }
+        .cmms-gantt-row-track::before {
+            /* Light vertical grid lines mirror the header ticks */
+            content: '';
+            position: absolute;
+            inset: 0;
+            background-image: linear-gradient(to right, #f1f5f9 1px, transparent 1px);
+            background-size: var(--cmms-gantt-tick-px, 100px) 100%;
+            pointer-events: none;
+        }
+        .cmms-gantt-bar {
+            position: absolute;
+            top: 50%;
+            transform: translateY(-50%);
+            height: 22px;
+            border-radius: 6px;
+            min-width: 6px;
+            background: #3b82f6;
+            display: flex;
+            align-items: center;
+            padding: 0 8px;
+            font-size: 11px;
+            font-weight: 600;
+            color: #fff;
+            cursor: pointer;
+            transition: filter .15s ease, transform .1s ease;
+            white-space: nowrap;
+            overflow: hidden;
+            box-shadow: 0 1px 2px rgba(15,23,42,.1);
+        }
+        .cmms-gantt-bar:hover { filter: brightness(1.08); }
+        .cmms-gantt-bar:active { transform: translateY(-50%) scale(.98); }
+        .cmms-gantt-bar.is-open       { background: #3b82f6; }
+        .cmms-gantt-bar.is-progress   { background: #ea580c; }
+        .cmms-gantt-bar.is-waiting    { background: #eab308; color:#451a03; }
+        .cmms-gantt-bar.is-completed  { background: #10b981; }
+        .cmms-gantt-bar.is-overdue    { background: #ef4444; }
+        .cmms-gantt-bar-warn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(255,255,255,.25);
+            border-radius: 4px;
+            padding: 0 4px;
+            margin-inline-start: 4px;
+            font-size: 10px;
+        }
+
+        /* "today" marker - vertical orange line through whole chart */
+        .cmms-gantt-today {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            width: 2px;
+            background: #ea580c;
+            z-index: 3;
+            pointer-events: none;
+        }
+        .cmms-gantt-today::before {
+            content: 'היום';
+            position: absolute;
+            top: 4px;
+            inset-inline-start: 4px;
+            background: #ea580c;
+            color: #fff;
+            font-size: 10px;
+            font-weight: 700;
+            padding: 1px 5px;
+            border-radius: 4px;
+            white-space: nowrap;
+        }
+
+        .cmms-gantt-legend {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            padding: 10px 14px;
+            border-top: 1px solid #e2e8f0;
+            background: #f8fafc;
+            font-size: 12px;
+            color: #64748b;
+        }
+        .cmms-gantt-legend-item { display: inline-flex; align-items: center; gap: 5px; }
+        .cmms-gantt-legend-dot {
+            width: 10px; height: 10px; border-radius: 3px; display: inline-block;
+        }
+
+        /* Mobile: tighter labels, ensure horizontal scroll works */
+        @media (max-width: 640px) {
+            .cmms-gantt-header-labels,
+            .cmms-gantt-row-label { width: 140px; padding: 8px 10px; font-size: 12px; }
+            .cmms-gantt-header-timeline,
+            .cmms-gantt-row-track { min-width: 480px; }
+            .cmms-gantt-bar { height: 20px; font-size: 10px; padding: 0 6px; }
+        }
+        </style>
+        <script>
+        (function () {
+            'use strict';
+            var section = document.getElementById('cmms-asset-tasks');
+            if (!section) return;
+            var buttons = section.querySelectorAll('[data-asset-view]');
+            var panes   = section.querySelectorAll('[data-asset-view-pane]');
+            buttons.forEach(function (btn) {
+                btn.addEventListener('click', function () {
+                    var view = btn.getAttribute('data-asset-view');
+                    buttons.forEach(function (b) {
+                        var on = (b === btn);
+                        b.classList.toggle('is-active', on);
+                        b.setAttribute('aria-selected', on ? 'true' : 'false');
+                    });
+                    panes.forEach(function (p) {
+                        p.hidden = (p.getAttribute('data-asset-view-pane') !== view);
+                    });
+                });
+            });
+        })();
+        </script>
+        <?php endif; ?>
+        <?php
+    }
+
+    /**
+     * 1.14.76 — Render a read-only Gantt chart of the tasks attached to
+     * an asset. Hidden by default; revealed by the "📊 גאנט" toggle.
+     *
+     * Time range for each task:
+     *   start = created_at
+     *   end   = if completed → completed_at
+     *           else if has due_date → due_date
+     *           else (open with no due) → "today" + an ⚠ marker
+     *
+     * The chart range expands to cover the earliest start and the latest
+     * end (or today, whichever is later). We bucket the timeline into
+     * sensible tick widths so the bars are visible without zooming.
+     *
+     * SVG-free implementation: pure CSS positioning so we keep the
+     * same render pipeline and avoid pulling in a chart library. The
+     * scrollable container guarantees the bars stay readable on mobile.
+     *
+     * Click on a bar = scroll-into-view of the matching task card in
+     * the list pane and flip the toggle back to "list" — so the user
+     * gets the full task details without leaving the asset page.
+     */
+    private function render_asset_tasks_gantt( $tasks, $u ) {
+        if ( empty( $tasks ) ) return;
+
+        // ─── Compute time bounds ────────────────────────────────────
+        $now_ts = current_time( 'timestamp' );
+        $min_ts = null;
+        $max_ts = null;
+
+        $task_rows = array();
+        foreach ( $tasks as $task ) {
+            $start_ts = ! empty( $task->created_at ) ? strtotime( $task->created_at ) : null;
+            if ( ! $start_ts ) continue;
+
+            $is_done = in_array( $task->status, array( 'completed', 'closed' ), true );
+            $end_ts  = null;
+            $no_due  = false;
+
+            if ( $is_done ) {
+                // Prefer completed_at; fall back to updated_at or due_date.
+                if ( ! empty( $task->completed_at ) ) {
+                    $end_ts = strtotime( $task->completed_at );
+                } elseif ( ! empty( $task->due_date ) ) {
+                    $end_ts = strtotime( $task->due_date );
+                } elseif ( ! empty( $task->updated_at ) ) {
+                    $end_ts = strtotime( $task->updated_at );
+                }
+            } else {
+                if ( ! empty( $task->due_date ) ) {
+                    $end_ts = strtotime( $task->due_date );
+                } else {
+                    // Open with no due date — extend to "now" and mark it.
+                    $end_ts = $now_ts;
+                    $no_due = true;
+                }
+            }
+
+            if ( ! $end_ts ) continue;
+            // Edge: end before start (data inconsistency) — give it a small slot.
+            if ( $end_ts < $start_ts ) $end_ts = $start_ts + DAY_IN_SECONDS;
+
+            // Status class for colouring.
+            $is_overdue = ( ! $is_done
+                            && ! empty( $task->due_date )
+                            && strtotime( $task->due_date ) < $now_ts );
+            $bar_class = 'is-open';
+            if ( $is_done )                           $bar_class = 'is-completed';
+            elseif ( $is_overdue )                    $bar_class = 'is-overdue';
+            elseif ( $task->status === 'in_progress' ) $bar_class = 'is-progress';
+            elseif ( $task->status === 'waiting' )    $bar_class = 'is-waiting';
+
+            $task_rows[] = array(
+                'task'      => $task,
+                'start_ts'  => $start_ts,
+                'end_ts'    => $end_ts,
+                'no_due'    => $no_due,
+                'bar_class' => $bar_class,
+            );
+
+            if ( $min_ts === null || $start_ts < $min_ts ) $min_ts = $start_ts;
+            if ( $max_ts === null || $end_ts   > $max_ts ) $max_ts = $end_ts;
+        }
+
+        if ( empty( $task_rows ) ) {
+            echo '<p class="cmms-muted cmms-text-sm" style="margin:0;">' . esc_html__( 'אין נתונים להצגה בגאנט.', 'cmms-light' ) . '</p>';
+            return;
+        }
+
+        // Always include "today" inside the visible range, and add a
+        // small breathing margin on each side so the first/last bars
+        // don't hug the edges.
+        if ( $now_ts < $min_ts ) $min_ts = $now_ts;
+        if ( $now_ts > $max_ts ) $max_ts = $now_ts;
+        $padding = max( DAY_IN_SECONDS * 2, (int) ( ( $max_ts - $min_ts ) * 0.05 ) );
+        $min_ts -= $padding;
+        $max_ts += $padding;
+        $total_span = max( 1, $max_ts - $min_ts );
+
+        // ─── Decide tick interval ────────────────────────────────────
+        // Goal: 5-10 ticks across the visible width. Choose a tick
+        // unit that fits the data span.
+        $days_span = $total_span / DAY_IN_SECONDS;
+        if ( $days_span <= 14 ) {
+            $tick_unit = 'day';     $tick_seconds = DAY_IN_SECONDS;
+        } elseif ( $days_span <= 90 ) {
+            $tick_unit = 'week';    $tick_seconds = 7 * DAY_IN_SECONDS;
+        } elseif ( $days_span <= 730 ) {
+            $tick_unit = 'month';   $tick_seconds = 30 * DAY_IN_SECONDS;
+        } else {
+            $tick_unit = 'quarter'; $tick_seconds = 90 * DAY_IN_SECONDS;
+        }
+
+        // ─── Helper to convert timestamp → percentage ───────────────
+        $pct = function ( $ts ) use ( $min_ts, $total_span ) {
+            $p = ( $ts - $min_ts ) / $total_span * 100;
+            if ( $p < 0 )   $p = 0;
+            if ( $p > 100 ) $p = 100;
+            return $p;
+        };
+
+        // Format tick label by unit type.
+        $fmt_tick = function ( $ts ) use ( $tick_unit ) {
+            switch ( $tick_unit ) {
+                case 'day':     return date_i18n( 'd/m', $ts );
+                case 'week':    return date_i18n( 'd/m', $ts );
+                case 'month':   return date_i18n( 'M Y', $ts );
+                case 'quarter': return date_i18n( 'M Y', $ts );
+            }
+            return date_i18n( 'd/m', $ts );
+        };
+        ?>
+        <div class="cmms-gantt">
+            <div class="cmms-gantt-scroll">
+                <div class="cmms-gantt-inner">
+                    <!-- Header row: empty corner cell + timeline ticks -->
+                    <div class="cmms-gantt-header">
+                        <div class="cmms-gantt-header-labels"><?php esc_html_e( 'משימה', 'cmms-light' ); ?></div>
+                        <div class="cmms-gantt-header-timeline">
+                            <?php
+                            // Render ticks from min_ts to max_ts at tick_seconds intervals.
+                            // First tick: align to start of unit so labels look clean.
+                            $tick_ts = $min_ts;
+                            // Snap to start of day at minimum.
+                            $tick_ts = strtotime( date( 'Y-m-d', $tick_ts ) );
+                            while ( $tick_ts <= $max_ts ) {
+                                $left = $pct( $tick_ts );
+                                ?>
+                                <div class="cmms-gantt-tick" style="inset-inline-start: <?php echo esc_attr( $left ); ?>%;">
+                                    <?php echo esc_html( $fmt_tick( $tick_ts ) ); ?>
+                                </div>
+                                <?php
+                                $tick_ts += $tick_seconds;
+                            }
+                            // Today marker.
+                            $today_left = $pct( $now_ts );
+                            ?>
+                            <div class="cmms-gantt-today" style="inset-inline-start: <?php echo esc_attr( $today_left ); ?>%;"></div>
+                        </div>
+                    </div>
+
+                    <!-- Body rows: one per task -->
+                    <?php foreach ( $task_rows as $row ) :
+                        $task = $row['task'];
+                        $bar_left  = $pct( $row['start_ts'] );
+                        $bar_right = $pct( $row['end_ts'] );
+                        $bar_width = max( 0.4, $bar_right - $bar_left );
+
+                        // Hebrew-friendly span: format like "12/03 → 28/03"
+                        $start_label = date_i18n( 'd/m/Y', $row['start_ts'] );
+                        $end_label   = date_i18n( 'd/m/Y', $row['end_ts'] );
+                        $tooltip     = $task->title . ' — ' . $start_label . ' ← ' . $end_label;
+                    ?>
+                    <div class="cmms-gantt-row">
+                        <div class="cmms-gantt-row-label">
+                            <span class="cmms-gantt-row-label-text" title="<?php echo esc_attr( $task->title ); ?>">
+                                <?php echo esc_html( $task->title ); ?>
+                            </span>
+                        </div>
+                        <div class="cmms-gantt-row-track">
+                            <a href="#"
+                               class="cmms-gantt-bar <?php echo esc_attr( $row['bar_class'] ); ?>"
+                               style="inset-inline-start: <?php echo esc_attr( $bar_left ); ?>%; width: <?php echo esc_attr( $bar_width ); ?>%;"
+                               data-gantt-task-id="<?php echo (int) $task->id; ?>"
+                               title="<?php echo esc_attr( $tooltip ); ?>">
+                                <?php echo esc_html( $start_label ); ?> ← <?php echo esc_html( $end_label ); ?>
+                                <?php if ( $row['no_due'] ) : ?>
+                                    <span class="cmms-gantt-bar-warn" title="<?php esc_attr_e( 'ללא תאריך יעד', 'cmms-light' ); ?>">⚠</span>
+                                <?php endif; ?>
+                            </a>
+                        </div>
+                    </div>
+                    <?php endforeach; ?>
+                </div>
+            </div>
+            <!-- Legend -->
+            <div class="cmms-gantt-legend">
+                <span class="cmms-gantt-legend-item"><span class="cmms-gantt-legend-dot" style="background:#3b82f6;"></span><?php esc_html_e( 'פתוח', 'cmms-light' ); ?></span>
+                <span class="cmms-gantt-legend-item"><span class="cmms-gantt-legend-dot" style="background:#ea580c;"></span><?php esc_html_e( 'בביצוע', 'cmms-light' ); ?></span>
+                <span class="cmms-gantt-legend-item"><span class="cmms-gantt-legend-dot" style="background:#eab308;"></span><?php esc_html_e( 'ממתין', 'cmms-light' ); ?></span>
+                <span class="cmms-gantt-legend-item"><span class="cmms-gantt-legend-dot" style="background:#10b981;"></span><?php esc_html_e( 'הושלם', 'cmms-light' ); ?></span>
+                <span class="cmms-gantt-legend-item"><span class="cmms-gantt-legend-dot" style="background:#ef4444;"></span><?php esc_html_e( 'באיחור', 'cmms-light' ); ?></span>
+                <span class="cmms-gantt-legend-item" style="margin-inline-start:auto;color:#94a3b8;">
+                    <?php esc_html_e( '⚠ = ללא תאריך יעד', 'cmms-light' ); ?>
+                </span>
+            </div>
+        </div>
+        <script>
+        // 1.14.76 — bar click: flip back to list view and scroll the
+        // matching task card into focus. We avoid changing routes — this
+        // keeps the existing list rendering authoritative.
+        (function () {
+            'use strict';
+            var section = document.getElementById('cmms-asset-tasks');
+            if (!section) return;
+            section.querySelectorAll('[data-gantt-task-id]').forEach(function (bar) {
+                bar.addEventListener('click', function (e) {
+                    e.preventDefault();
+                    var id = bar.getAttribute('data-gantt-task-id');
+                    // Switch toggle to list.
+                    var listBtn = section.querySelector('[data-asset-view="list"]');
+                    if (listBtn) listBtn.click();
+                    // Find the matching task card. The list renders each
+                    // task card with the task id as an attribute via
+                    // task_card(); fall back to data-task-id on common
+                    // wrappers if the exact selector misses.
+                    var card = section.querySelector('[data-task-id="' + id + '"]')
+                             || section.querySelector('#task-' + id)
+                             || section.querySelector('[data-id="' + id + '"]');
+                    if (card && card.scrollIntoView) {
+                        card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        card.style.transition = 'box-shadow .3s ease';
+                        card.style.boxShadow = '0 0 0 3px rgba(234,88,12,.4)';
+                        setTimeout(function () { card.style.boxShadow = ''; }, 1500);
+                    }
+                });
+            });
+        })();
+        </script>
+        <?php
+    }
+
+    /**
+     * 1.14.77 — Render a Kanban board for a list of tasks.
+     *
+     * Used in two places:
+     *   1. Main /tasks view (toggle: List / Kanban)
+     *   2. Asset detail tasks block (toggle: List / Gantt / Kanban)
+     *
+     * Layout: one column per status (open, in_progress, waiting,
+     * completed). Each column has its tasks as cards. Drag-and-drop
+     * between columns updates the task's status via AJAX (no page
+     * reload). Optimistic UI — the card moves immediately; if the
+     * server rejects (auth, validation), we roll back.
+     *
+     * Authorization: server-side. cmms_kanban_status checks
+     * can_participate_task; users without permission see the board
+     * but cannot drop cards into different columns successfully.
+     *
+     * @param array  $tasks      Task rows from CMMS_Tasks::list_for_user.
+     * @param object $u          Current user (for permission checks in UI).
+     * @param string $instance   Unique DOM id suffix so we can render
+     *                           multiple Kanbans on a single page
+     *                           without DOM collisions.
+     */
+    private function render_kanban_board( $tasks, $u, $instance = 'main' ) {
+        if ( empty( $tasks ) ) {
+            echo '<p class="cmms-muted cmms-text-sm" style="margin:0;">' . esc_html__( 'אין משימות להצגה ב-Kanban.', 'cmms-light' ) . '</p>';
+            return;
+        }
+
+        // Column definitions: status key + label + accent colour.
+        $columns = array(
+            'open' => array(
+                'label' => 'פתוח',
+                'color' => '#3b82f6',
+                'icon'  => '📋',
+            ),
+            'in_progress' => array(
+                'label' => 'בביצוע',
+                'color' => '#ea580c',
+                'icon'  => '⚙',
+            ),
+            'waiting' => array(
+                'label' => 'ממתין',
+                'color' => '#eab308',
+                'icon'  => '⏸',
+            ),
+            'completed' => array(
+                'label' => 'הושלם',
+                'color' => '#10b981',
+                'icon'  => '✓',
+            ),
+        );
+
+        // Bucket tasks by status. Treat legacy 'closed' as 'completed'
+        // so it doesn't fall off the board.
+        $bucketed = array_fill_keys( array_keys( $columns ), array() );
+        foreach ( $tasks as $task ) {
+            $st = $task->status === 'closed' ? 'completed' : $task->status;
+            if ( ! isset( $bucketed[ $st ] ) ) continue;
+            $bucketed[ $st ][] = $task;
+        }
+
+        $kanban_id  = 'cmms-kanban-' . sanitize_key( $instance );
+        $now_ts     = current_time( 'timestamp' );
+        $nonce      = wp_create_nonce( 'cmms_kanban' );
+        $ajax_url   = admin_url( 'admin-ajax.php' );
+
+        $priority_labels = array(
+            'low'    => array( 'label' => 'נמוכה',  'color' => '#94a3b8' ),
+            'normal' => array( 'label' => 'רגילה',  'color' => '#64748b' ),
+            'high'   => array( 'label' => 'גבוהה',  'color' => '#ea580c' ),
+            'urgent' => array( 'label' => 'דחופה',  'color' => '#dc2626' ),
+        );
+
+        ?>
+        <div class="cmms-kanban" id="<?php echo esc_attr( $kanban_id ); ?>"
+             data-ajax-url="<?php echo esc_url( $ajax_url ); ?>"
+             data-nonce="<?php echo esc_attr( $nonce ); ?>">
+
+            <div class="cmms-kanban-board">
+                <?php foreach ( $columns as $status_key => $col ) :
+                    $col_tasks = $bucketed[ $status_key ];
+                    $count = count( $col_tasks );
+                ?>
+                <div class="cmms-kanban-column"
+                     data-status="<?php echo esc_attr( $status_key ); ?>"
+                     style="--cmms-col-color: <?php echo esc_attr( $col['color'] ); ?>;">
+                    <div class="cmms-kanban-column-head">
+                        <span class="cmms-kanban-column-icon"><?php echo esc_html( $col['icon'] ); ?></span>
+                        <span class="cmms-kanban-column-label"><?php echo esc_html( $col['label'] ); ?></span>
+                        <span class="cmms-kanban-column-count"><?php echo (int) $count; ?></span>
+                    </div>
+                    <div class="cmms-kanban-column-body" data-drop-status="<?php echo esc_attr( $status_key ); ?>">
+                        <?php if ( $count === 0 ) : ?>
+                            <div class="cmms-kanban-column-empty">
+                                <?php esc_html_e( 'גרור משימות לכאן', 'cmms-light' ); ?>
+                            </div>
+                        <?php endif; ?>
+                        <?php foreach ( $col_tasks as $task ) :
+                            $can_move = CMMS_Auth::can_participate_task( $u, $task );
+                            $due_ts   = ! empty( $task->due_date ) ? strtotime( $task->due_date ) : null;
+                            $is_overdue = ( $status_key !== 'completed'
+                                           && $due_ts && $due_ts < $now_ts );
+                            $pri_meta = $priority_labels[ $task->priority ] ?? $priority_labels['normal'];
+
+                            // Assignee name
+                            $assignee_name = '';
+                            if ( ! empty( $task->assigned_to ) ) {
+                                $a_user = CMMS_Users::get( (int) $task->assigned_to );
+                                if ( $a_user ) {
+                                    $assignee_name = $a_user->display_name ?: '';
+                                }
+                            }
+
+                            $task_url = $this->url( array( 'view' => 'task', 'id' => $task->id ) );
+                        ?>
+                        <div class="cmms-kanban-card <?php echo $is_overdue ? 'is-overdue' : ''; ?>"
+                             draggable="<?php echo $can_move ? 'true' : 'false'; ?>"
+                             data-task-id="<?php echo (int) $task->id; ?>"
+                             data-current-status="<?php echo esc_attr( $status_key ); ?>"
+                             data-task-url="<?php echo esc_url( $task_url ); ?>"
+                             data-can-move="<?php echo $can_move ? '1' : '0'; ?>">
+                            <?php // 1.14.78: ⋯ menu button — mobile backup
+                                  //  for users who can't (or won't) drag.
+                                  //  Opens an inline dropdown with 4
+                                  //  status options. Shown only when the
+                                  //  user has permission to change status.
+                                  if ( $can_move ) : ?>
+                            <button type="button"
+                                    class="cmms-kanban-card-menu-btn"
+                                    aria-label="<?php esc_attr_e( 'תפריט פעולות', 'cmms-light' ); ?>"
+                                    aria-expanded="false">⋯</button>
+                            <div class="cmms-kanban-card-menu" hidden role="menu">
+                                <p class="cmms-kanban-card-menu-title"><?php esc_html_e( 'העבר ל:', 'cmms-light' ); ?></p>
+                                <?php foreach ( $columns as $target_status => $target_col ) :
+                                    $is_current = ( $target_status === $status_key ); ?>
+                                <button type="button"
+                                        class="cmms-kanban-card-menu-item <?php echo $is_current ? 'is-current' : ''; ?>"
+                                        data-move-to="<?php echo esc_attr( $target_status ); ?>"
+                                        <?php echo $is_current ? 'disabled' : ''; ?>
+                                        role="menuitem">
+                                    <span class="cmms-kanban-card-menu-dot" style="background:<?php echo esc_attr( $target_col['color'] ); ?>;"></span>
+                                    <span><?php echo esc_html( $target_col['icon'] ); ?> <?php echo esc_html( $target_col['label'] ); ?><?php echo $is_current ? ' ' . esc_html__( '(נוכחי)', 'cmms-light' ) : ''; ?></span>
+                                </button>
+                                <?php endforeach; ?>
+                            </div>
+                            <?php endif; ?>
+                            <div class="cmms-kanban-card-title">
+                                <?php echo esc_html( $task->title ); ?>
+                            </div>
+                            <div class="cmms-kanban-card-meta">
+                                <?php if ( $assignee_name ) : ?>
+                                    <span class="cmms-kanban-card-assignee" title="מבצע">
+                                        👤 <?php echo esc_html( $assignee_name ); ?>
+                                    </span>
+                                <?php endif; ?>
+                                <?php if ( $due_ts ) : ?>
+                                    <span class="cmms-kanban-card-due <?php echo $is_overdue ? 'is-overdue' : ''; ?>" title="תאריך יעד">
+                                        📅 <?php echo esc_html( date_i18n( 'd/m', $due_ts ) ); ?>
+                                    </span>
+                                <?php endif; ?>
+                                <?php if ( $task->priority !== 'normal' ) : ?>
+                                    <span class="cmms-kanban-card-priority"
+                                          style="background:<?php echo esc_attr( $pri_meta['color'] ); ?>;">
+                                        <?php echo esc_html( $pri_meta['label'] ); ?>
+                                    </span>
+                                <?php endif; ?>
+                            </div>
+                        </div>
+                        <?php endforeach; ?>
+                    </div>
+                </div>
+                <?php endforeach; ?>
+            </div>
+        </div>
+        <?php
+        // Render the Kanban CSS+JS only once per page, even if we render
+        // multiple boards. A static flag tracks whether we've emitted it.
+        static $kanban_assets_emitted = false;
+        if ( $kanban_assets_emitted ) return;
+        $kanban_assets_emitted = true;
+        ?>
+
+        <style>
+        /* 1.14.77 — Kanban board styles. Scoped to .cmms-kanban-*. */
+        .cmms-kanban {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            padding: 14px;
+            overflow: hidden;
+        }
+        .cmms-kanban-board {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(220px, 1fr));
+            gap: 12px;
+        }
+        @media (max-width: 900px) {
+            .cmms-kanban {
+                overflow-x: auto;
+                -webkit-overflow-scrolling: touch;
+            }
+            .cmms-kanban-board {
+                grid-template-columns: repeat(4, 260px);
+                min-width: max-content;
+            }
+        }
+
+        .cmms-kanban-column {
+            background: #fff;
+            border-radius: 10px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            min-height: 200px;
+            border-top: 3px solid var(--cmms-col-color);
+        }
+        .cmms-kanban-column-head {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 10px 14px;
+            background: #fff;
+            border-bottom: 1px solid #f1f5f9;
+            font-size: 13px;
+            font-weight: 600;
+            color: #0f172a;
+        }
+        .cmms-kanban-column-icon { font-size: 14px; }
+        .cmms-kanban-column-label { flex: 1; }
+        .cmms-kanban-column-count {
+            background: #f1f5f9;
+            color: #475569;
+            padding: 1px 8px;
+            border-radius: 999px;
+            font-size: 12px;
+            min-width: 22px;
+            text-align: center;
+        }
+        .cmms-kanban-column-body {
+            flex: 1;
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            transition: background .15s ease;
+            min-height: 100px;
+        }
+        .cmms-kanban-column-body.is-drag-over {
+            background: rgba(79, 70, 229, 0.06);
+        }
+        .cmms-kanban-column-empty {
+            color: #cbd5e1;
+            font-size: 12px;
+            text-align: center;
+            padding: 18px 8px;
+            border: 1.5px dashed #e2e8f0;
+            border-radius: 8px;
+        }
+
+        .cmms-kanban-card {
+            background: #fff;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 10px 12px;
+            cursor: pointer;
+            transition: transform .12s ease, box-shadow .15s ease, border-color .15s ease;
+            position: relative;
+            /* 1.14.78: prevent native text selection during long-press on mobile */
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-touch-callout: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+        .cmms-kanban-card:hover {
+            box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
+            border-color: #cbd5e1;
+        }
+        .cmms-kanban-card[draggable="true"] { cursor: grab; }
+        .cmms-kanban-card.is-dragging {
+            opacity: 0.5;
+            cursor: grabbing;
+        }
+        /* 1.14.78: long-press "armed" state — card lifts and gets a violet ring
+           so the user sees the gesture took effect before they start moving. */
+        .cmms-kanban-card.is-press-armed {
+            border-color: #4f46e5;
+            border-width: 2px;
+            transform: scale(1.04);
+            box-shadow: 0 8px 20px rgba(79, 70, 229, 0.25);
+            z-index: 5;
+        }
+        .cmms-kanban-card.is-press-armed::after {
+            content: '📌 גרור לעמודה אחרת';
+            position: absolute;
+            top: calc(100% + 6px);
+            inset-inline-start: 50%;
+            transform: translateX(-50%);
+            background: #eef2ff;
+            color: #4f46e5;
+            font-size: 10.5px;
+            font-weight: 600;
+            padding: 3px 10px;
+            border-radius: 999px;
+            white-space: nowrap;
+            pointer-events: none;
+            z-index: 6;
+        }
+        .cmms-kanban-card.is-overdue {
+            border-color: #fca5a5;
+            background: #fef2f2;
+        }
+        .cmms-kanban-card.is-saving {
+            pointer-events: none;
+            opacity: 0.7;
+        }
+        .cmms-kanban-card.is-error {
+            animation: cmms-kanban-shake .35s ease;
+            border-color: #ef4444;
+        }
+        @keyframes cmms-kanban-shake {
+            0%, 100% { transform: translateX(0); }
+            25%      { transform: translateX(-6px); }
+            75%      { transform: translateX(6px); }
+        }
+
+        /* 1.14.78: ⋯ menu button — small, in the card corner */
+        .cmms-kanban-card-menu-btn {
+            position: absolute;
+            top: 6px;
+            inset-inline-end: 6px;
+            width: 30px;
+            height: 30px;
+            border: 0;
+            background: transparent;
+            color: #64748b;
+            font-size: 18px;
+            line-height: 1;
+            cursor: pointer;
+            border-radius: 6px;
+            padding: 0;
+            font-family: inherit;
+            transition: background .15s ease, color .15s ease;
+            z-index: 2;
+        }
+        .cmms-kanban-card-menu-btn:hover {
+            background: #f1f5f9;
+            color: #0f172a;
+        }
+        .cmms-kanban-card-menu-btn:focus-visible {
+            outline: 2px solid #4f46e5;
+            outline-offset: 1px;
+        }
+        /* Push card title a bit to leave room for the ⋯ button */
+        .cmms-kanban-card-menu-btn + .cmms-kanban-card-title {
+            padding-inline-end: 30px;
+        }
+
+        /* 1.14.78: inline dropdown menu (shown above card body) */
+        .cmms-kanban-card-menu {
+            position: absolute;
+            top: 38px;
+            inset-inline-start: 6px;
+            inset-inline-end: 6px;
+            background: #fff;
+            border: 1px solid #cbd5e1;
+            border-radius: 8px;
+            box-shadow: 0 8px 20px rgba(15, 23, 42, 0.15);
+            padding: 4px;
+            z-index: 10;
+        }
+        .cmms-kanban-card-menu[hidden] { display: none; }
+        .cmms-kanban-card-menu-title {
+            font-size: 11px;
+            color: #64748b;
+            font-weight: 600;
+            margin: 0;
+            padding: 6px 10px 4px;
+        }
+        .cmms-kanban-card-menu-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            width: 100%;
+            padding: 8px 10px;
+            background: transparent;
+            border: 0;
+            font-size: 13px;
+            color: #0f172a;
+            cursor: pointer;
+            border-radius: 4px;
+            text-align: start;
+            font-family: inherit;
+            transition: background .12s ease;
+        }
+        .cmms-kanban-card-menu-item:hover:not(:disabled) {
+            background: #f8fafc;
+        }
+        .cmms-kanban-card-menu-item:disabled,
+        .cmms-kanban-card-menu-item.is-current {
+            background: #f8fafc;
+            color: #94a3b8;
+            cursor: default;
+        }
+        .cmms-kanban-card-menu-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            flex: none;
+        }
+
+        .cmms-kanban-card-title {
+            font-size: 13.5px;
+            font-weight: 600;
+            color: #0f172a;
+            margin-bottom: 6px;
+            line-height: 1.4;
+        }
+        .cmms-kanban-card-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            font-size: 11.5px;
+            color: #64748b;
+        }
+        .cmms-kanban-card-assignee,
+        .cmms-kanban-card-due {
+            display: inline-flex;
+            align-items: center;
+            gap: 3px;
+            background: #f8fafc;
+            border-radius: 4px;
+            padding: 2px 6px;
+        }
+        .cmms-kanban-card-due.is-overdue {
+            background: #fee2e2;
+            color: #991b1b;
+            font-weight: 600;
+        }
+        .cmms-kanban-card-priority {
+            color: #fff;
+            border-radius: 4px;
+            padding: 2px 7px;
+            font-size: 10.5px;
+            font-weight: 700;
+        }
+
+        /* Toast feedback after a save */
+        .cmms-kanban-toast {
+            position: fixed;
+            bottom: 24px;
+            inset-inline-start: 50%;
+            transform: translateX(-50%);
+            background: #0f172a;
+            color: #fff;
+            padding: 10px 18px;
+            border-radius: 999px;
+            font-size: 13px;
+            font-weight: 500;
+            box-shadow: 0 6px 20px rgba(15,23,42,.3);
+            z-index: 99999;
+            opacity: 0;
+            transition: opacity .2s ease;
+            pointer-events: none;
+        }
+        .cmms-kanban-toast.is-visible { opacity: 1; }
+        .cmms-kanban-toast.is-error { background: #b91c1c; }
+        </style>
+
+        <script>
+        (function () {
+            'use strict';
+            // Find every Kanban board on the page (could be more than one).
+            var boards = document.querySelectorAll('.cmms-kanban');
+            if (!boards.length) return;
+
+            // Shared toast — one element for all boards on the page.
+            var toast = document.createElement('div');
+            toast.className = 'cmms-kanban-toast';
+            toast.setAttribute('role', 'status');
+            toast.setAttribute('aria-live', 'polite');
+            document.body.appendChild(toast);
+            var toastTimer = null;
+            function showToast(msg, isError) {
+                toast.textContent = msg;
+                toast.classList.toggle('is-error', !!isError);
+                toast.classList.add('is-visible');
+                if (toastTimer) clearTimeout(toastTimer);
+                toastTimer = setTimeout(function () {
+                    toast.classList.remove('is-visible');
+                }, 2500);
+            }
+
+            // Detect touch capability. We treat the FIRST input modality
+            // we see as authoritative for THIS page-load — hybrid devices
+            // (touchscreen laptop) start in whichever mode the user uses
+            // first. Either way, the menu (⋯) button is always present
+            // as a safety net for permission-holders.
+            var hasTouch = ('ontouchstart' in window)
+                         || (navigator.maxTouchPoints > 0);
+
+            // Globally track if a long-press is "armed" so click handlers
+            // can avoid firing while dragging.
+            var anyArmed = false;
+
+            boards.forEach(function (board) {
+                var ajaxUrl   = board.getAttribute('data-ajax-url');
+                var nonce     = board.getAttribute('data-nonce');
+                var cards     = board.querySelectorAll('.cmms-kanban-card');
+                var dropZones = board.querySelectorAll('.cmms-kanban-column-body');
+                var draggedCard = null;
+
+                /* ─────────────────────────────────────────────────────
+                   HTML5 desktop drag (unchanged from 1.14.77).
+                ───────────────────────────────────────────────────── */
+                var dragStarted = false;
+                cards.forEach(function (card) {
+                    if (card.getAttribute('draggable') === 'true') {
+                        card.addEventListener('dragstart', function (e) {
+                            dragStarted = true;
+                            draggedCard = card;
+                            card.classList.add('is-dragging');
+                            try { e.dataTransfer.setData('text/plain', card.getAttribute('data-task-id')); } catch (_) {}
+                            try { e.dataTransfer.effectAllowed = 'move'; } catch (_) {}
+                        });
+                        card.addEventListener('dragend', function () {
+                            card.classList.remove('is-dragging');
+                            draggedCard = null;
+                            setTimeout(function () { dragStarted = false; }, 50);
+                        });
+                    }
+
+                    /* ─────────────────────────────────────────────────
+                       Click on card (NOT menu/drag) → open task.
+                    ───────────────────────────────────────────────── */
+                    card.addEventListener('click', function (e) {
+                        // Don't navigate if user pressed the ⋯ menu or
+                        // its inner items — those have their own logic.
+                        if (e.target.closest('.cmms-kanban-card-menu-btn')) return;
+                        if (e.target.closest('.cmms-kanban-card-menu'))     return;
+                        // Don't navigate if a drag finished or a long-press is armed.
+                        if (dragStarted || anyArmed) { dragStarted = false; return; }
+                        var url = card.getAttribute('data-task-url');
+                        if (url) window.location.href = url;
+                    });
+                });
+
+                /* ─────────────────────────────────────────────────────
+                   Desktop dropZones.
+                ───────────────────────────────────────────────────── */
+                dropZones.forEach(function (zone) {
+                    zone.addEventListener('dragover', function (e) {
+                        if (!draggedCard) return;
+                        e.preventDefault();
+                        try { e.dataTransfer.dropEffect = 'move'; } catch (_) {}
+                        zone.classList.add('is-drag-over');
+                    });
+                    zone.addEventListener('dragleave', function (e) {
+                        if (e.target !== zone) return;
+                        zone.classList.remove('is-drag-over');
+                    });
+                    zone.addEventListener('drop', function (e) {
+                        e.preventDefault();
+                        zone.classList.remove('is-drag-over');
+                        if (!draggedCard) return;
+                        commitMove(draggedCard, zone);
+                    });
+                });
+
+                /* ─────────────────────────────────────────────────────
+                   1.14.78 — Touch / long-press support.
+
+                   Strategy:
+                     • touchstart → schedule a 400ms timer
+                     • if the finger moves >10px before the timer fires
+                       → cancel (treated as a scroll, not a press)
+                     • if the timer fires → "arm" the card (visual hint)
+                     • after armed, touchmove tracks finger position
+                       against drop zones; matched zone gets is-drag-over
+                     • touchend on an armed card → commit move into the
+                       matched zone, or rollback if none matched
+                ───────────────────────────────────────────────────── */
+                if (hasTouch) {
+                    var pressTimer = null;
+                    var pressedCard = null;
+                    var pressStartX = 0;
+                    var pressStartY = 0;
+                    var armed = false;
+                    var lastZoneOver = null;
+                    var LONG_PRESS_MS = 400;
+                    var MOVE_TOLERANCE_PX = 10;
+
+                    cards.forEach(function (card) {
+                        if (card.getAttribute('data-can-move') !== '1') return;
+
+                        card.addEventListener('touchstart', function (e) {
+                            if (e.touches.length !== 1) return;
+                            var t = e.touches[0];
+                            pressedCard = card;
+                            pressStartX = t.clientX;
+                            pressStartY = t.clientY;
+                            armed = false;
+                            anyArmed = false;
+                            pressTimer = setTimeout(function () {
+                                // Long-press fired: arm the card.
+                                armed = true;
+                                anyArmed = true;
+                                card.classList.add('is-press-armed');
+                                // Haptic feedback if available.
+                                if (navigator.vibrate) {
+                                    try { navigator.vibrate(15); } catch (_) {}
+                                }
+                                // Once armed, prevent scrolling and let
+                                // touchmove dictate drag position. Note:
+                                // we don't preventDefault here — we do
+                                // that on touchmove (after arming) to
+                                // keep scroll working until the user
+                                // actually long-presses.
+                            }, LONG_PRESS_MS);
+                        }, { passive: true });
+
+                        card.addEventListener('touchmove', function (e) {
+                            if (!pressedCard) return;
+                            var t = e.touches[0];
+                            var dx = Math.abs(t.clientX - pressStartX);
+                            var dy = Math.abs(t.clientY - pressStartY);
+
+                            if (!armed) {
+                                // Not armed yet: any meaningful move cancels.
+                                if (dx > MOVE_TOLERANCE_PX || dy > MOVE_TOLERANCE_PX) {
+                                    if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+                                    pressedCard = null;
+                                }
+                                return;
+                            }
+
+                            // Armed: track which dropZone the finger is over.
+                            // preventDefault keeps the page from scrolling
+                            // while the user drags. Without it iOS Safari
+                            // happily scrolls the column out from under
+                            // the finger.
+                            try { e.preventDefault(); } catch (_) {}
+
+                            var el = document.elementFromPoint(t.clientX, t.clientY);
+                            var zone = el ? el.closest('.cmms-kanban-column-body') : null;
+                            if (zone !== lastZoneOver) {
+                                if (lastZoneOver) lastZoneOver.classList.remove('is-drag-over');
+                                if (zone)         zone.classList.add('is-drag-over');
+                                lastZoneOver = zone;
+                            }
+                        }, { passive: false });
+
+                        card.addEventListener('touchend', function () {
+                            if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+                            if (armed && pressedCard) {
+                                pressedCard.classList.remove('is-press-armed');
+                                if (lastZoneOver) {
+                                    lastZoneOver.classList.remove('is-drag-over');
+                                    commitMove(pressedCard, lastZoneOver);
+                                }
+                            }
+                            armed = false;
+                            // Slight delay so the synthesized click event
+                            // (which fires after touchend on iOS) sees
+                            // anyArmed=true and aborts.
+                            setTimeout(function () { anyArmed = false; }, 50);
+                            pressedCard = null;
+                            lastZoneOver = null;
+                        });
+
+                        card.addEventListener('touchcancel', function () {
+                            if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+                            if (lastZoneOver) lastZoneOver.classList.remove('is-drag-over');
+                            if (pressedCard)  pressedCard.classList.remove('is-press-armed');
+                            armed = false;
+                            anyArmed = false;
+                            pressedCard = null;
+                            lastZoneOver = null;
+                        });
+                    });
+                }
+
+                /* ─────────────────────────────────────────────────────
+                   1.14.78 — ⋯ menu button (mobile backup + keyboard a11y).
+                ───────────────────────────────────────────────────── */
+                board.querySelectorAll('.cmms-kanban-card-menu-btn').forEach(function (btn) {
+                    btn.addEventListener('click', function (e) {
+                        e.stopPropagation();
+                        var card = btn.closest('.cmms-kanban-card');
+                        var menu = card.querySelector('.cmms-kanban-card-menu');
+                        if (!menu) return;
+                        var isOpen = !menu.hidden;
+                        // Close any other open menus on this board first.
+                        board.querySelectorAll('.cmms-kanban-card-menu').forEach(function (m) {
+                            m.hidden = true;
+                            var b = m.parentElement && m.parentElement.querySelector('.cmms-kanban-card-menu-btn');
+                            if (b) b.setAttribute('aria-expanded', 'false');
+                        });
+                        menu.hidden = isOpen;
+                        btn.setAttribute('aria-expanded', isOpen ? 'false' : 'true');
+                    });
+                });
+
+                // Click outside → close any open menus on this board.
+                document.addEventListener('click', function (e) {
+                    if (e.target.closest('.cmms-kanban-card-menu-btn')) return;
+                    if (e.target.closest('.cmms-kanban-card-menu'))     return;
+                    board.querySelectorAll('.cmms-kanban-card-menu').forEach(function (m) {
+                        m.hidden = true;
+                        var b = m.parentElement && m.parentElement.querySelector('.cmms-kanban-card-menu-btn');
+                        if (b) b.setAttribute('aria-expanded', 'false');
+                    });
+                });
+
+                // Wire each menu item: click → move card to that status.
+                board.querySelectorAll('.cmms-kanban-card-menu-item').forEach(function (item) {
+                    item.addEventListener('click', function (e) {
+                        e.stopPropagation();
+                        if (item.disabled) return;
+                        var target = item.getAttribute('data-move-to');
+                        var card   = item.closest('.cmms-kanban-card');
+                        var zone   = board.querySelector('[data-drop-status="' + target + '"]');
+                        if (!card || !zone) return;
+                        // Close the menu.
+                        var menu = item.closest('.cmms-kanban-card-menu');
+                        if (menu) menu.hidden = true;
+                        var btn = card.querySelector('.cmms-kanban-card-menu-btn');
+                        if (btn) btn.setAttribute('aria-expanded', 'false');
+                        commitMove(card, zone);
+                    });
+                });
+
+                /* ─────────────────────────────────────────────────────
+                   Shared mover — used by desktop drag, touch drag, and
+                   the ⋯ menu. Optimistic UI + rollback on failure.
+                ───────────────────────────────────────────────────── */
+                function commitMove(card, zone) {
+                    var newStatus = zone.getAttribute('data-drop-status');
+                    var oldStatus = card.getAttribute('data-current-status');
+                    if (newStatus === oldStatus) return;
+
+                    var taskId     = card.getAttribute('data-task-id');
+                    var sourceZone = card.parentElement;
+
+                    var emptyEl = zone.querySelector('.cmms-kanban-column-empty');
+                    if (emptyEl) emptyEl.remove();
+
+                    zone.appendChild(card);
+                    card.setAttribute('data-current-status', newStatus);
+                    card.classList.add('is-saving');
+
+                    if (sourceZone && !sourceZone.querySelector('.cmms-kanban-card')) {
+                        var emp = document.createElement('div');
+                        emp.className = 'cmms-kanban-column-empty';
+                        emp.textContent = 'גרור משימות לכאן';
+                        sourceZone.appendChild(emp);
+                    }
+                    updateColumnCounts(board);
+                    // Also refresh the menu's "(נוכחי)" state on this card.
+                    refreshCardMenu(card, newStatus);
+
+                    var body = new URLSearchParams();
+                    body.set('action',  'cmms_kanban_status');
+                    body.set('nonce',   nonce);
+                    body.set('task_id', taskId);
+                    body.set('status',  newStatus);
+
+                    fetch(ajaxUrl, {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: body.toString()
+                    })
+                    .then(function (r) { return r.json().catch(function () { return null; }); })
+                    .then(function (res) {
+                        card.classList.remove('is-saving');
+                        if (res && res.success) {
+                            showToast('הסטטוס עודכן');
+                        } else {
+                            rollback(card, sourceZone, oldStatus);
+                            var msg = (res && res.data && res.data.message) ? res.data.message : 'העדכון נכשל. נסה שוב.';
+                            showToast(msg, true);
+                        }
+                    })
+                    .catch(function () {
+                        card.classList.remove('is-saving');
+                        rollback(card, sourceZone, oldStatus);
+                        showToast('שגיאת רשת. נסה שוב.', true);
+                    });
+                }
+
+                function rollback(card, sourceZone, oldStatus) {
+                    if (!sourceZone) return;
+                    var emp = sourceZone.querySelector('.cmms-kanban-column-empty');
+                    if (emp) emp.remove();
+                    sourceZone.appendChild(card);
+                    card.setAttribute('data-current-status', oldStatus);
+                    card.classList.add('is-error');
+                    setTimeout(function () { card.classList.remove('is-error'); }, 400);
+                    updateColumnCounts(board);
+                    refreshCardMenu(card, oldStatus);
+                }
+
+                function updateColumnCounts(board) {
+                    board.querySelectorAll('.cmms-kanban-column').forEach(function (col) {
+                        var n = col.querySelectorAll('.cmms-kanban-card').length;
+                        var c = col.querySelector('.cmms-kanban-column-count');
+                        if (c) c.textContent = String(n);
+                    });
+                }
+
+                // After moving a card, update the menu items so the new
+                // current status is marked (נוכחי) and the previous one
+                // becomes clickable again.
+                function refreshCardMenu(card, currentStatus) {
+                    var items = card.querySelectorAll('.cmms-kanban-card-menu-item');
+                    items.forEach(function (it) {
+                        var target = it.getAttribute('data-move-to');
+                        var label  = it.querySelector('span:last-child');
+                        if (!label) return;
+                        var isCurrent = (target === currentStatus);
+                        it.classList.toggle('is-current', isCurrent);
+                        it.disabled = isCurrent;
+                        // Strip any existing " (נוכחי)" suffix and re-add if needed.
+                        var clean = label.textContent.replace(/\s*\(נוכחי\)\s*$/u, '');
+                        label.textContent = clean + (isCurrent ? ' (נוכחי)' : '');
+                    });
+                }
+            });
+        })();
+        </script>
+        <?php
+    }
+
+    /**
+     * 1.14.81 — Calendar (month) view.
+     *
+     * Renders a full-month grid (desktop) or a compact month grid +
+     * selected-day list (mobile). Only tasks with a non-empty due_date
+     * are shown — tasks without due_date are summarized in a banner.
+     *
+     * Server-side scoped: list_for_user is called with date_from /
+     * date_to restricting the SQL to the requested month + a small
+     * overlap (covers the prev/next month days visible in the grid).
+     * So even with thousands of tasks in the account, only ~30-50
+     * rows are fetched per render.
+     *
+     * URL params:
+     *   ?view=tasks&display=calendar      → current month
+     *   &month=2026-05                    → specific month (YYYY-MM)
+     *   &day=2026-05-20                   → preselected day on mobile
+     *
+     * The chosen view (list/kanban/calendar) is persisted in
+     * localStorage — see the script at the bottom of view_tasks.
+     *
+     * @param object $u       Current CMMS user.
+     * @param array  $filters Filters carried over from view_tasks
+     *                        (mine, status, etc) — passed through so
+     *                        the calendar respects the same scoping.
+     */
+    private function render_calendar_view( $u, $filters = array() ) {
+        // ─────────────────────────────────────────────────────────────
+        // 1. Resolve the month to render. Default = current month.
+        // ─────────────────────────────────────────────────────────────
+        $month_param = isset( $_GET['month'] ) ? sanitize_text_field( wp_unslash( $_GET['month'] ) ) : '';
+        if ( $month_param && preg_match( '/^(\d{4})-(\d{2})$/', $month_param, $m ) ) {
+            $year  = (int) $m[1];
+            $month = (int) $m[2];
+            if ( $month < 1 || $month > 12 ) {
+                $year  = (int) date_i18n( 'Y' );
+                $month = (int) date_i18n( 'n' );
+            }
+        } else {
+            $year  = (int) date_i18n( 'Y' );
+            $month = (int) date_i18n( 'n' );
+        }
+        $first_day_ts = mktime( 0, 0, 0, $month, 1, $year );
+        $days_in_mon  = (int) date( 't', $first_day_ts );
+        $first_dow    = (int) date( 'w', $first_day_ts ); // 0=Sun, ..., 6=Sat (Hebrew calendar week starts Sunday)
+
+        // 2. Build the visible grid range (always 6 weeks = 42 cells
+        //    so the calendar height is stable).
+        //    grid_start_ts = the Sunday that contains or precedes day 1.
+        $grid_start_ts = strtotime( '-' . $first_dow . ' days', $first_day_ts );
+        $grid_end_ts   = $grid_start_ts + ( 42 * 86400 ) - 1;
+
+        // 3. Fetch tasks for this window — server-side, date-bound.
+        //    list_for_user supports date_from / date_to / date_field.
+        $calendar_filters = $filters;
+        $calendar_filters['date_from']  = date( 'Y-m-d', $grid_start_ts );
+        $calendar_filters['date_to']    = date( 'Y-m-d', $grid_end_ts );
+        $calendar_filters['date_field'] = 'due_date';
+        $calendar_filters['limit']      = 500; // safety cap, same as default
+        $tasks = CMMS_Tasks::list_for_user( $u, $calendar_filters );
+
+        // 4. Count tasks without due_date (separately, lightweight).
+        //    Only show banner if there are any — keeps UI quiet.
+        $no_due_filters = $filters;
+        $no_due_filters['no_due_date'] = 1;
+        $no_due_filters['limit']       = 50; // we only need the count, but the
+                                              // method returns rows; we just count()
+        $no_due_count = 0;
+        if ( method_exists( 'CMMS_Tasks', 'list_for_user' ) ) {
+            // We don't have a dedicated count method, so fetch the rows
+            // (up to limit) and count. Cheap with the index on due_date.
+            // If the list_for_user doesn't support no_due_date, this
+            // falls through harmlessly returning 0.
+            $no_due_rows = CMMS_Tasks::list_for_user( $u, $no_due_filters );
+            $no_due_count = is_array( $no_due_rows ) ? count( $no_due_rows ) : 0;
+        }
+
+        // 5. Bucket tasks by their due-date YYYY-MM-DD.
+        $by_day = array();
+        foreach ( $tasks as $t ) {
+            if ( empty( $t->due_date ) ) continue;
+            $key = substr( (string) $t->due_date, 0, 10 );
+            if ( ! isset( $by_day[ $key ] ) ) $by_day[ $key ] = array();
+            $by_day[ $key ][] = $t;
+        }
+
+        // 6. Resolve "selected day" for mobile (defaults to today if it's
+        //    in the current month, else day 1).
+        $today_ymd = date_i18n( 'Y-m-d' );
+        // 1.14.81.2: 'day' is a reserved WordPress query var (used by
+        // date-archive rewrites like /2026/05/14/). When we pass
+        // ?day=2026-05-14 in our URL, WP intercepts and tries to load
+        // a non-existent date archive → 404. Rename to cmms_day.
+        $selected_day_param = isset( $_GET['cmms_day'] ) ? sanitize_text_field( wp_unslash( $_GET['cmms_day'] ) ) : '';
+        if ( $selected_day_param && preg_match( '/^\d{4}-\d{2}-\d{2}$/', $selected_day_param ) ) {
+            $selected_day = $selected_day_param;
+        } else {
+            // Default to today if today falls in this month, else day 1.
+            if ( (int) date( 'n', strtotime( $today_ymd ) ) === $month
+                 && (int) date( 'Y', strtotime( $today_ymd ) ) === $year ) {
+                $selected_day = $today_ymd;
+            } else {
+                $selected_day = sprintf( '%04d-%02d-01', $year, $month );
+            }
+        }
+
+        // 7. Build navigation URLs.
+        $prev_ts = mktime( 0, 0, 0, $month - 1, 1, $year );
+        $next_ts = mktime( 0, 0, 0, $month + 1, 1, $year );
+        $base_args = array( 'view' => 'tasks', 'display' => 'calendar' );
+        if ( ! empty( $filters['mine'] ) )        $base_args['mine'] = 1;
+        if ( ! empty( $filters['status'] ) )      $base_args['status'] = $filters['status'];
+        if ( ! empty( $filters['as_assignee'] ) ) $base_args['as_assignee'] = 1;
+        if ( ! empty( $filters['as_manager'] ) )  $base_args['as_manager'] = 1;
+        if ( ! empty( $filters['overdue'] ) )     $base_args['overdue'] = 1;
+
+        $url_prev  = $this->url( array_merge( $base_args, array( 'month' => date( 'Y-m', $prev_ts ) ) ) );
+        $url_next  = $this->url( array_merge( $base_args, array( 'month' => date( 'Y-m', $next_ts ) ) ) );
+        $url_today = $this->url( array_merge( $base_args, array( 'month' => date_i18n( 'Y-m' ) ) ) );
+
+        $month_names_he = array(
+            1 => 'ינואר', 2 => 'פברואר', 3 => 'מרץ',     4 => 'אפריל',
+            5 => 'מאי',    6 => 'יוני',    7 => 'יולי',    8 => 'אוגוסט',
+            9 => 'ספטמבר', 10 => 'אוקטובר', 11 => 'נובמבר', 12 => 'דצמבר',
+        );
+
+        // Status → dot color. Synced with the inline-status-changer
+        // dot colors so the calendar feels consistent with the rest.
+        $status_colors = array(
+            'open'        => '#8b5cf6',
+            'in_progress' => '#f97316',
+            'waiting'     => '#94a3b8',
+            'completed'   => '#10b981',
+            'closed'      => '#10b981',
+        );
+
+        $is_priv = in_array( $u->role, array( CMMS_Auth::ROLE_OWNER, CMMS_Auth::ROLE_MANAGER ), true );
+
+        ?>
+        <div class="cmms-calendar" data-current-month="<?php echo esc_attr( sprintf( '%04d-%02d', $year, $month ) ); ?>">
+
+            <div class="cmms-cal-head">
+                <div class="cmms-cal-head-title">
+                    <div class="cmms-cal-head-month-name"><?php echo esc_html( $month_names_he[ $month ] ); ?></div>
+                    <h2 class="cmms-cal-head-year"><?php echo (int) $year; ?></h2>
+                </div>
+                <div class="cmms-cal-head-actions">
+                    <a class="cmms-cal-nav-btn" href="<?php echo esc_url( $url_prev ); ?>" aria-label="<?php esc_attr_e( 'חודש קודם', 'cmms-light' ); ?>">‹</a>
+                    <a class="cmms-cal-today-btn" href="<?php echo esc_url( $url_today ); ?>"><?php esc_html_e( 'היום', 'cmms-light' ); ?></a>
+                    <a class="cmms-cal-nav-btn" href="<?php echo esc_url( $url_next ); ?>" aria-label="<?php esc_attr_e( 'חודש הבא', 'cmms-light' ); ?>">›</a>
+                </div>
+            </div>
+
+            <?php if ( $no_due_count > 0 ) :
+                // 1.14.81.1: link to a filtered list view so the user
+                // can actually fix those tasks. Carries the user's
+                // existing scope (mine/status/etc) and adds no_due_date=1
+                // which view_tasks now respects.
+                $list_url = $this->url( array_merge( $base_args, array(
+                    'display'     => 'list',
+                    'no_due_date' => 1,
+                ) ) );
+            ?>
+            <div class="cmms-cal-no-due-banner">
+                ⓘ <strong><?php echo (int) $no_due_count; ?> <?php esc_html_e( 'משימות ללא תאריך יעד', 'cmms-light' ); ?></strong>
+                · <a href="<?php echo esc_url( $list_url ); ?>"><?php esc_html_e( 'הצג ברשימה', 'cmms-light' ); ?></a>
+            </div>
+            <?php endif; ?>
+
+            <div class="cmms-cal-grid-wrap">
+                <div class="cmms-cal-weekdays">
+                    <div>ראשון</div>
+                    <div>שני</div>
+                    <div>שלישי</div>
+                    <div>רביעי</div>
+                    <div>חמישי</div>
+                    <div>שישי</div>
+                    <div>שבת</div>
+                </div>
+                <div class="cmms-cal-grid">
+                    <?php
+                    // Render 42 cells (6 weeks × 7 days).
+                    for ( $i = 0; $i < 42; $i++ ) {
+                        $cell_ts   = $grid_start_ts + ( $i * 86400 );
+                        $cell_ymd  = date( 'Y-m-d', $cell_ts );
+                        $cell_dnum = (int) date( 'j', $cell_ts );
+                        $cell_mon  = (int) date( 'n', $cell_ts );
+
+                        $in_current_month = ( $cell_mon === $month );
+                        $is_today  = ( $cell_ymd === $today_ymd );
+                        $day_tasks = $by_day[ $cell_ymd ] ?? array();
+
+                        // Determine if any task on this day is overdue
+                        // (i.e. before today AND not completed/closed).
+                        $has_overdue = false;
+                        foreach ( $day_tasks as $dt ) {
+                            if ( $cell_ymd < $today_ymd
+                                 && ! in_array( $dt->status, array( 'completed', 'closed' ), true ) ) {
+                                $has_overdue = true;
+                                break;
+                            }
+                        }
+
+                        $cell_classes = array( 'cmms-cal-cell' );
+                        if ( ! $in_current_month ) $cell_classes[] = 'is-other-month';
+                        if ( $is_today )           $cell_classes[] = 'is-today';
+                        if ( $has_overdue )        $cell_classes[] = 'has-overdue';
+                        if ( $cell_ymd === $selected_day ) $cell_classes[] = 'is-selected';
+
+                        // Build a day-select URL for mobile (keeps month
+                        // but changes the day param). Using cmms_day
+                        // (not day) to avoid clashing with WordPress
+                        // date-archive query var.
+                        $day_args = array_merge( $base_args, array(
+                            'month'    => sprintf( '%04d-%02d', $year, $month ),
+                            'cmms_day' => $cell_ymd,
+                        ) );
+                        $day_url = $this->url( $day_args );
+                        ?>
+                        <a class="<?php echo esc_attr( implode( ' ', $cell_classes ) ); ?>"
+                           href="<?php echo esc_url( $day_url ); ?>"
+                           data-day="<?php echo esc_attr( $cell_ymd ); ?>">
+                            <div class="cmms-cal-cell-day-num"><?php echo (int) $cell_dnum; ?><?php if ( $is_today ) : ?><span class="cmms-cal-today-badge"></span><?php endif; ?></div>
+                            <?php if ( ! empty( $day_tasks ) ) : ?>
+                                <div class="cmms-cal-cell-tasks">
+                                    <?php
+                                    $shown = 0;
+                                    foreach ( $day_tasks as $dt ) {
+                                        if ( $shown >= 3 ) break;
+                                        $is_dt_overdue = ( $cell_ymd < $today_ymd
+                                                           && ! in_array( $dt->status, array( 'completed', 'closed' ), true ) );
+                                        $dot_color = $is_dt_overdue ? '#dc2626' : ( $status_colors[ $dt->status ] ?? '#94a3b8' );
+                                        $task_url  = $this->url( array( 'view' => 'task', 'id' => (int) $dt->id ) );
+                                        ?>
+                                        <span class="cmms-cal-task <?php echo $is_dt_overdue ? 'is-overdue' : ''; ?>"
+                                              data-task-url="<?php echo esc_url( $task_url ); ?>"
+                                              title="<?php echo esc_attr( $dt->title ); ?>">
+                                            <span class="cmms-cal-task-dot" style="background:<?php echo esc_attr( $dot_color ); ?>;"></span>
+                                            <span class="cmms-cal-task-title"><?php echo esc_html( $dt->title ); ?></span>
+                                        </span>
+                                        <?php
+                                        $shown++;
+                                    }
+                                    $remaining = count( $day_tasks ) - $shown;
+                                    if ( $remaining > 0 ) : ?>
+                                        <span class="cmms-cal-more">+ <?php echo (int) $remaining; ?></span>
+                                    <?php endif; ?>
+                                </div>
+                                <div class="cmms-cal-cell-dots">
+                                    <?php
+                                    // Mobile-only: stacked dots showing task statuses.
+                                    $shown_dot = 0;
+                                    foreach ( $day_tasks as $dt ) {
+                                        if ( $shown_dot >= 3 ) break;
+                                        $is_dt_overdue = ( $cell_ymd < $today_ymd
+                                                           && ! in_array( $dt->status, array( 'completed', 'closed' ), true ) );
+                                        $dot_color = $is_dt_overdue ? '#dc2626' : ( $status_colors[ $dt->status ] ?? '#94a3b8' );
+                                        ?>
+                                        <span class="cmms-cal-mini-dot" style="background:<?php echo esc_attr( $dot_color ); ?>;"></span>
+                                        <?php
+                                        $shown_dot++;
+                                    }
+                                    if ( count( $day_tasks ) > 3 ) : ?>
+                                        <span class="cmms-cal-mini-dot" style="background:#94a3b8;"></span>
+                                    <?php endif; ?>
+                                </div>
+                            <?php endif; ?>
+                        </a>
+                        <?php
+                    }
+                    ?>
+                </div>
+            </div>
+
+            <?php // Mobile-only: list of tasks for the selected day. ?>
+            <div class="cmms-cal-day-list">
+                <?php
+                $sel_ts = strtotime( $selected_day );
+                $sel_tasks = $by_day[ $selected_day ] ?? array();
+                $sel_dow_he = array( 'ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת' );
+                $sel_dnum = (int) date( 'j', $sel_ts );
+                $sel_mon  = (int) date( 'n', $sel_ts );
+                $is_sel_today = ( $selected_day === $today_ymd );
+                ?>
+                <div class="cmms-cal-day-list-head">
+                    <div class="cmms-cal-day-list-date"><?php echo (int) $sel_dnum; ?> <?php echo esc_html( $month_names_he[ $sel_mon ] ); ?></div>
+                    <div class="cmms-cal-day-list-dow">
+                        <?php if ( $is_sel_today ) : ?>
+                            <span class="cmms-cal-day-list-today"><?php esc_html_e( 'היום', 'cmms-light' ); ?> · </span>
+                        <?php endif; ?>
+                        <?php echo esc_html( $sel_dow_he[ (int) date( 'w', $sel_ts ) ] ); ?>
+                    </div>
+                </div>
+                <?php if ( empty( $sel_tasks ) ) : ?>
+                    <div class="cmms-cal-day-list-empty"><?php esc_html_e( 'אין משימות ביום זה', 'cmms-light' ); ?></div>
+                <?php else :
+                    foreach ( $sel_tasks as $dt ) :
+                        $is_dt_overdue = ( $selected_day < $today_ymd
+                                           && ! in_array( $dt->status, array( 'completed', 'closed' ), true ) );
+                        $dot_color = $is_dt_overdue ? '#dc2626' : ( $status_colors[ $dt->status ] ?? '#94a3b8' );
+                        $task_url  = $this->url( array( 'view' => 'task', 'id' => (int) $dt->id ) );
+
+                        // Tiny meta line: assignee / asset.
+                        $meta_parts = array();
+                        if ( ! empty( $dt->assigned_to ) ) {
+                            $au = CMMS_Users::get( (int) $dt->assigned_to );
+                            if ( $au && ! empty( $au->display_name ) ) {
+                                $meta_parts[] = '👤 ' . $au->display_name;
+                            }
+                        }
+                        if ( ! empty( $dt->asset_id ) ) {
+                            $an = CMMS_Assets::asset_name( (int) $dt->asset_id );
+                            if ( $an ) $meta_parts[] = '📍 ' . $an;
+                        }
+                        ?>
+                        <a class="cmms-cal-day-task <?php echo $is_dt_overdue ? 'is-overdue' : ''; ?>"
+                           href="<?php echo esc_url( $task_url ); ?>">
+                            <div class="cmms-cal-day-task-main">
+                                <span class="cmms-cal-day-task-dot" style="background:<?php echo esc_attr( $dot_color ); ?>;"></span>
+                                <span class="cmms-cal-day-task-title"><?php echo esc_html( $dt->title ); ?></span>
+                            </div>
+                            <?php if ( ! empty( $meta_parts ) ) : ?>
+                                <div class="cmms-cal-day-task-meta"><?php echo esc_html( implode( ' · ', $meta_parts ) ); ?></div>
+                            <?php endif; ?>
+                        </a>
+                    <?php endforeach;
+                endif; ?>
+            </div>
+
+        </div>
+
+        <?php $this->calendar_view_assets(); ?>
+        <?php
+    }
+
+    /**
+     * 1.14.81 — CSS + JS for the calendar view. Emitted once per page
+     * (static flag). Separate from inline_status_changer_assets so the
+     * two features can be used independently.
+     */
+    private function calendar_view_assets() {
+        static $emitted = false;
+        if ( $emitted ) return;
+        $emitted = true;
+        ?>
+        <style>
+        /* 1.14.81 — Calendar view, Apple-inspired aesthetic.
+           Two layouts: desktop (full 7×6 grid with inline task pills)
+           and mobile (compact grid with colored dots + selected-day list). */
+
+        .cmms-calendar {
+            background: #fafafa;
+            border-radius: 16px;
+            padding: 20px;
+            font-family: -apple-system, 'Segoe UI', Arial, sans-serif;
+        }
+
+        .cmms-cal-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-end;
+            margin-bottom: 18px;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        .cmms-cal-head-title { line-height: 1; }
+        .cmms-cal-head-month-name {
+            font-size: 13px;
+            color: #f97316;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+        .cmms-cal-head-year {
+            margin: 0;
+            font-size: 28px;
+            font-weight: 700;
+            color: #0f172a;
+            letter-spacing: -0.5px;
+            line-height: 1;
+        }
+        .cmms-cal-head-actions {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+        .cmms-cal-nav-btn,
+        .cmms-cal-today-btn {
+            background: white;
+            border: 0;
+            border-radius: 999px;
+            cursor: pointer;
+            color: #475569;
+            text-decoration: none;
+            font-family: inherit;
+            transition: box-shadow .15s ease;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .cmms-cal-nav-btn { width: 34px; height: 34px; font-size: 16px; }
+        .cmms-cal-today-btn { padding: 7px 14px; font-size: 12px; font-weight: 600; }
+        .cmms-cal-nav-btn:hover,
+        .cmms-cal-today-btn:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+
+        .cmms-cal-no-due-banner {
+            background: #fff7ed;
+            border: 1px solid #fed7aa;
+            color: #9a3412;
+            padding: 8px 12px;
+            border-radius: 8px;
+            font-size: 12px;
+            margin-bottom: 14px;
+        }
+        .cmms-cal-no-due-banner a { color: #c2410c; text-decoration: underline; }
+
+        .cmms-cal-weekdays {
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            margin-bottom: 4px;
+        }
+        .cmms-cal-weekdays > div {
+            text-align: center;
+            font-size: 11px;
+            color: #94a3b8;
+            font-weight: 500;
+            padding: 8px 0;
+        }
+        .cmms-cal-grid {
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            gap: 4px;
+        }
+        .cmms-cal-cell {
+            min-height: 100px;
+            padding: 8px;
+            border-radius: 10px;
+            text-decoration: none;
+            color: inherit;
+            display: flex;
+            flex-direction: column;
+            transition: background .15s ease;
+        }
+        .cmms-cal-cell:hover { background: #f1f5f9; }
+        .cmms-cal-cell.is-other-month .cmms-cal-cell-day-num { color: #cbd5e1; }
+        .cmms-cal-cell.has-overdue { background: rgba(239,68,68,0.04); }
+        .cmms-cal-cell.has-overdue:hover { background: rgba(239,68,68,0.08); }
+
+        .cmms-cal-cell-day-num {
+            font-size: 14px;
+            font-weight: 500;
+            color: #475569;
+            margin-bottom: 6px;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .cmms-cal-cell.is-today .cmms-cal-cell-day-num {
+            color: white;
+            background: #f97316;
+            width: 26px;
+            height: 26px;
+            border-radius: 50%;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 13px;
+        }
+        .cmms-cal-today-badge { display: none; } /* not needed on desktop; cell styling handles it */
+
+        .cmms-cal-cell-tasks {
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            flex: 1;
+            min-height: 0;
+        }
+        .cmms-cal-task {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 11px;
+            color: #475569;
+            text-decoration: none;
+            padding: 1px 0;
+            overflow: hidden;
+        }
+        .cmms-cal-task:hover { color: #0f172a; }
+        .cmms-cal-task.is-overdue { color: #dc2626; font-weight: 500; }
+        .cmms-cal-task-dot {
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            flex: none;
+        }
+        .cmms-cal-task-title {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .cmms-cal-more {
+            font-size: 10px;
+            color: #94a3b8;
+            margin-top: 2px;
+        }
+        .cmms-cal-cell-dots { display: none; }
+
+        /* Mobile-only day list (hidden on desktop). */
+        .cmms-cal-day-list { display: none; }
+
+        /* ─────────────────────────────────────────────────────
+           MOBILE (<= 640px)
+           Compact grid + selected day's task list below.
+        ───────────────────────────────────────────────────── */
+        @media (max-width: 640px) {
+            .cmms-calendar { padding: 14px; border-radius: 20px; }
+            .cmms-cal-head-year { font-size: 22px; }
+            .cmms-cal-nav-btn { width: 30px; height: 30px; font-size: 13px; }
+            .cmms-cal-today-btn { padding: 6px 11px; font-size: 11px; }
+
+            .cmms-cal-grid-wrap {
+                background: white;
+                border-radius: 14px;
+                padding: 12px 8px;
+                margin-bottom: 14px;
+            }
+
+            .cmms-cal-weekdays > div { font-size: 10px; padding: 4px 0; }
+            .cmms-cal-grid { gap: 2px; }
+            .cmms-cal-cell {
+                min-height: 0;
+                aspect-ratio: 1;
+                padding: 4px 0;
+                align-items: center;
+                justify-content: center;
+                border-radius: 8px;
+            }
+            .cmms-cal-cell-day-num {
+                font-size: 12px;
+                margin-bottom: 2px;
+            }
+            .cmms-cal-cell.is-today .cmms-cal-cell-day-num {
+                width: 22px;
+                height: 22px;
+                font-size: 11px;
+            }
+            .cmms-cal-cell.is-selected:not(.is-today) {
+                background: #fef3c7;
+            }
+            .cmms-cal-cell-tasks { display: none; }
+            .cmms-cal-cell-dots {
+                display: flex;
+                gap: 2px;
+                justify-content: center;
+                margin-top: 1px;
+            }
+            .cmms-cal-mini-dot {
+                width: 4px;
+                height: 4px;
+                border-radius: 50%;
+            }
+
+            .cmms-cal-day-list {
+                display: block;
+            }
+            .cmms-cal-day-list-head {
+                display: flex;
+                align-items: baseline;
+                gap: 8px;
+                margin-bottom: 10px;
+                padding: 0 4px;
+            }
+            .cmms-cal-day-list-date {
+                font-size: 18px;
+                font-weight: 700;
+                color: #0f172a;
+            }
+            .cmms-cal-day-list-dow {
+                font-size: 12px;
+                color: #94a3b8;
+            }
+            .cmms-cal-day-list-today {
+                color: #f97316;
+                font-weight: 600;
+            }
+            .cmms-cal-day-list-empty {
+                background: white;
+                padding: 18px;
+                text-align: center;
+                color: #94a3b8;
+                font-size: 13px;
+                border-radius: 12px;
+            }
+            .cmms-cal-day-task {
+                background: white;
+                padding: 12px 14px;
+                border-radius: 12px;
+                margin-bottom: 6px;
+                text-decoration: none;
+                color: inherit;
+                display: block;
+            }
+            .cmms-cal-day-task.is-overdue {
+                background: #fff1f0;
+                border: 1px solid #fecaca;
+            }
+            .cmms-cal-day-task-main {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            .cmms-cal-day-task-dot {
+                width: 6px;
+                height: 6px;
+                border-radius: 50%;
+                flex: none;
+            }
+            .cmms-cal-day-task-title {
+                font-size: 13.5px;
+                color: #0f172a;
+                flex: 1;
+            }
+            .cmms-cal-day-task.is-overdue .cmms-cal-day-task-title {
+                color: #991b1b;
+                font-weight: 500;
+            }
+            .cmms-cal-day-task-meta {
+                font-size: 11px;
+                color: #94a3b8;
+                margin-top: 4px;
+                padding-inline-start: 14px;
+            }
+            .cmms-cal-day-task.is-overdue .cmms-cal-day-task-meta { color: #dc2626; }
+        }
+        </style>
+
+        <script>
+        (function () {
+            'use strict';
+            // Desktop click handling: clicking a task pill inside a cell
+            // should navigate to the task, not select the day. Cells
+            // themselves are <a>s that change the selected day (URL
+            // param). The task <span> inside intercepts.
+            document.querySelectorAll('.cmms-cal-task').forEach(function (taskEl) {
+                taskEl.addEventListener('click', function (e) {
+                    var url = taskEl.getAttribute('data-task-url');
+                    if (!url) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    window.location.href = url;
+                });
+            });
+        })();
+        </script>
         <?php
     }
 
@@ -4967,6 +9982,132 @@ body {
         <?php
     }
 
+    /**
+     * 1.15.5: Email-to-task inbound log — a dedicated screen showing
+     * all incoming emails across the account, newest first. Replaces
+     * the idea of cramming this into each form's edit page (which
+     * would add weight and scatter the data per-form).
+     */
+    private function view_email_log( $u ) {
+        if ( ! CMMS_Auth::can( 'manage_forms' ) ) { $this->forbidden(); return; }
+
+        // Optional filter by form.
+        $filter_form_id = isset( $_GET['form_id'] ) ? (int) $_GET['form_id'] : 0;
+
+        $rows  = CMMS_Email_Inbox::get_inbound_log( $u->account_id, 100, $filter_form_id );
+        $forms = CMMS_Forms::list_by_account( $u->account_id );
+
+        // Map form_id → name for display.
+        $form_names = array();
+        foreach ( $forms as $f ) {
+            $form_names[ (int) $f->id ] = $f->name;
+        }
+        ?>
+        <div class="cmms-page-head">
+            <div>
+                <h1 class="cmms-page-title">
+                    📥 <?php esc_html_e( 'מיילים נכנסים', 'cmms-light' ); ?>
+                </h1>
+                <p class="cmms-page-sub">
+                    <?php esc_html_e( 'מיילים שהתקבלו דרך Email-to-Task והפכו למשימות. נשמרים 30 יום אחורה.', 'cmms-light' ); ?>
+                </p>
+            </div>
+        </div>
+
+        <div class="cmms-section">
+            <div class="cmms-section-body">
+                <?php // ── Filter by form ── ?>
+                <form method="get" action="" class="cmms-flex cmms-gap-2 cmms-mb-3" style="align-items:center;flex-wrap:wrap;">
+                    <input type="hidden" name="view" value="email_log">
+                    <label style="font-size:13px;color:#475569;"><?php esc_html_e( 'סנן לפי טופס:', 'cmms-light' ); ?></label>
+                    <select name="form_id" class="cmms-input" style="max-width:260px;" onchange="this.form.submit()">
+                        <option value="0"><?php esc_html_e( 'כל הטפסים', 'cmms-light' ); ?></option>
+                        <?php foreach ( $forms as $f ) : ?>
+                            <option value="<?php echo (int) $f->id; ?>" <?php selected( $filter_form_id, (int) $f->id ); ?>>
+                                <?php echo esc_html( $f->name ); ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </form>
+
+                <?php if ( empty( $rows ) ) : ?>
+                    <div style="background:#f8fafc;border:1px dashed #cbd5e1;border-radius:8px;padding:32px;text-align:center;color:#64748b;">
+                        <div style="font-size:32px;margin-bottom:8px;">📭</div>
+                        <div style="font-size:14px;font-weight:600;color:#475569;margin-bottom:4px;">
+                            <?php esc_html_e( 'עדיין לא התקבלו מיילים', 'cmms-light' ); ?>
+                        </div>
+                        <div style="font-size:12px;">
+                            <?php esc_html_e( 'מיילים שיישלחו לכתובות ה-Email-to-Task יופיעו כאן.', 'cmms-light' ); ?>
+                        </div>
+                    </div>
+                <?php else : ?>
+                    <div style="overflow-x:auto;">
+                        <table class="cmms-table" style="width:100%;border-collapse:collapse;font-size:13px;">
+                            <thead>
+                                <tr style="border-bottom:2px solid #e2e8f0;text-align:right;">
+                                    <th style="padding:8px;"><?php esc_html_e( 'נושא', 'cmms-light' ); ?></th>
+                                    <th style="padding:8px;"><?php esc_html_e( 'שולח', 'cmms-light' ); ?></th>
+                                    <th style="padding:8px;"><?php esc_html_e( 'טופס', 'cmms-light' ); ?></th>
+                                    <th style="padding:8px;"><?php esc_html_e( 'תאריך', 'cmms-light' ); ?></th>
+                                    <th style="padding:8px;"><?php esc_html_e( 'סטטוס', 'cmms-light' ); ?></th>
+                                    <th style="padding:8px;"></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php foreach ( $rows as $row ) :
+                                    $is_ok = ( $row->status === 'created' );
+                                    $status_bg    = $is_ok ? '#dcfce7' : '#fee2e2';
+                                    $status_color = $is_ok ? '#166534' : '#991b1b';
+                                    $status_text  = $is_ok ? __( 'נוצרה משימה', 'cmms-light' ) : __( 'נכשל', 'cmms-light' );
+                                    $sender = $row->from_name ? $row->from_name : $row->from_email;
+                                ?>
+                                    <tr style="border-bottom:1px solid #f1f5f9;">
+                                        <td style="padding:8px;font-weight:500;color:#0f172a;max-width:240px;">
+                                            <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                                                <?php echo esc_html( $row->subject ?: __( '(ללא נושא)', 'cmms-light' ) ); ?>
+                                            </div>
+                                            <?php if ( ! $is_ok && $row->error_message ) : ?>
+                                                <div style="font-size:11px;color:#b91c1c;margin-top:2px;">
+                                                    <?php echo esc_html( $row->error_message ); ?>
+                                                </div>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td style="padding:8px;color:#475569;max-width:180px;">
+                                            <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                                                <?php echo esc_html( $sender ?: '—' ); ?>
+                                            </div>
+                                        </td>
+                                        <td style="padding:8px;color:#64748b;font-size:12px;">
+                                            <?php echo esc_html( $form_names[ (int) $row->form_id ] ?? '—' ); ?>
+                                        </td>
+                                        <td style="padding:8px;color:#64748b;font-size:12px;white-space:nowrap;">
+                                            <?php echo esc_html( mysql2date( 'd/m/Y H:i', $row->received_at ) ); ?>
+                                        </td>
+                                        <td style="padding:8px;">
+                                            <span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;background:<?php echo esc_attr( $status_bg ); ?>;color:<?php echo esc_attr( $status_color ); ?>;white-space:nowrap;">
+                                                <?php echo esc_html( $status_text ); ?>
+                                            </span>
+                                        </td>
+                                        <td style="padding:8px;white-space:nowrap;">
+                                            <?php if ( $is_ok && $row->task_id ) : ?>
+                                                <a class="cmms-btn cmms-btn-sm cmms-btn-ghost"
+                                                   href="<?php echo esc_url( $this->url( array( 'view' => 'task', 'id' => (int) $row->task_id ) ) ); ?>"
+                                                   style="font-size:11px;">
+                                                    <?php esc_html_e( 'פתח משימה ←', 'cmms-light' ); ?>
+                                                </a>
+                                            <?php endif; ?>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                <?php endif; ?>
+            </div>
+        </div>
+        <?php
+    }
+
     private function view_forms( $u ) {
         if ( ! CMMS_Auth::can( 'manage_forms' ) ) { $this->forbidden(); return; }
         $forms = CMMS_Forms::list_by_account( $u->account_id );
@@ -5061,6 +10202,22 @@ body {
                                         <option value=""><?php $this->e( 'common.none' ); ?></option>
                                         <?php foreach ( $users as $usr ) : if ( ! in_array( $usr->role, array( 'owner', 'manager' ), true ) ) continue; ?>
                                             <option value="<?php echo (int) $usr->id; ?>" <?php selected( $form->manager_id == $usr->id ); ?>><?php echo esc_html( $usr->display_name ); ?></option>
+                                        <?php endforeach; ?>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="cmms-form-row cols-2">
+                                <?php // 1.15.11: Default assignee ("מוקצה ל") — the
+                                      // technician who performs the work. Unlike the
+                                      // manager (owner/manager roles only), the assignee
+                                      // can be any account member, since technicians
+                                      // are often the 'tech' role. ?>
+                                <div class="cmms-field">
+                                    <label class="cmms-field-label"><?php esc_html_e( 'מוקצה ל (ברירת מחדל)', 'cmms-light' ); ?></label>
+                                    <select class="cmms-select" name="default_assignee_id">
+                                        <option value=""><?php $this->e( 'common.none' ); ?></option>
+                                        <?php foreach ( $users as $usr ) : ?>
+                                            <option value="<?php echo (int) $usr->id; ?>" <?php selected( isset( $form->default_assignee_id ) && $form->default_assignee_id == $usr->id ); ?>><?php echo esc_html( $usr->display_name ); ?></option>
                                         <?php endforeach; ?>
                                     </select>
                                 </div>
@@ -5246,8 +10403,1321 @@ body {
                         </div>
                     </div>
                 </section>
+
+                <?php
+                // 1.14.94: Webhook API section. Renders the API key UI,
+                // documentation, and copy-paste cURL example. Hidden
+                // behind a click-to-reveal because most users won't
+                // need it — keeps the UI uncluttered for the 90% case.
+                $this->render_form_webhook_section( $form );
+
+                // 1.14.99: Email-to-Task section. Same lifecycle as the
+                // webhook section (generate/rotate/revoke a public
+                // identifier) but the identifier is an email address
+                // local-part instead of an API key.
+                $this->render_form_email_inbox_section( $form );
+                ?>
             </aside>
         </div>
+        <?php
+    }
+
+    /**
+     * 1.14.94: Render the Webhook API section in the form-edit page
+     * sidebar. Shown to managers/owners. The UI has two states:
+     *
+     *  - No key issued: a single "Generate API Key" button.
+     *  - Key issued:    masked key + endpoint URL + cURL example +
+     *                   field-mapping reference + rotate/revoke buttons.
+     *
+     * If a key was just generated (passed via ?cmms_new_key=... in the
+     * URL), we show the FULL plaintext key once with a "save this" alert.
+     */
+    private function render_form_webhook_section( $form ) {
+        // Permission: only managers/owners can manage webhook keys.
+        // Reporters/technicians don't see this section at all.
+        if ( ! CMMS_Auth::can( 'manage_forms' ) ) return;
+
+        $key_info  = CMMS_Webhook::get_key_info( $form->id );
+        $webhook_url = CMMS_Webhook::webhook_url( $form );
+
+        // One-time plaintext key reveal. Only shown right after generation.
+        // The plaintext is passed as a transient (5 min TTL) so we don't
+        // need to expose it via URL parameters.
+        $just_generated_key = null;
+        if ( isset( $_GET['cmms_key_token'] ) ) {
+            $token = sanitize_key( wp_unslash( $_GET['cmms_key_token'] ) );
+            $stored = get_transient( 'cmms_webhook_new_key_' . $token );
+            if ( $stored && isset( $stored['form_id'] ) && (int) $stored['form_id'] === (int) $form->id ) {
+                $just_generated_key = $stored['plaintext'];
+                delete_transient( 'cmms_webhook_new_key_' . $token );
+            }
+        }
+
+        $schema = CMMS_Webhook::get_schema_for_ui( $form );
+        ?>
+        <section class="cmms-section" style="margin-top:16px;">
+            <div class="cmms-section-head">
+                <h3 class="cmms-section-title">
+                    <?php CMMS_Icons::e( 'zap', 16 ); ?>
+                    <?php echo esc_html__( 'Webhook API', 'cmms-light' ); ?>
+                </h3>
+            </div>
+            <div class="cmms-section-body">
+                <p class="cmms-text-sm cmms-mb-3" style="color:#475569;">
+                    <?php echo esc_html__( 'Allow external systems (customer portals, ticketing systems) to create tasks on this form automatically by sending JSON over HTTPS.', 'cmms-light' ); ?>
+                </p>
+
+                <?php if ( $just_generated_key ) : ?>
+                    <div class="cmms-alert cmms-alert-success" style="display:block;margin-bottom:12px;">
+                        <div style="font-weight:600;margin-bottom:6px;">
+                            <?php CMMS_Icons::e( 'check-circle', 16 ); ?>
+                            <?php echo esc_html__( 'New API key created', 'cmms-light' ); ?>
+                        </div>
+                        <div style="font-size:13px;margin-bottom:8px;color:#065f46;">
+                            <?php echo esc_html__( 'Copy this key now — it will not be shown again for security reasons. If you lose it, generate a new one.', 'cmms-light' ); ?>
+                        </div>
+                        <div style="display:flex;gap:6px;align-items:stretch;">
+                            <input type="text" class="cmms-input" readonly
+                                   value="<?php echo esc_attr( $just_generated_key ); ?>"
+                                   id="cmms-webhook-new-key"
+                                   onclick="this.select();"
+                                   style="font-family:monospace;font-size:12px;background:#fff;">
+                            <button type="button" class="cmms-btn cmms-btn-secondary cmms-btn-sm"
+                                    onclick="(function(b){var i=document.getElementById('cmms-webhook-new-key');i.select();document.execCommand('copy');b.textContent='<?php echo esc_js( __( 'Copied', 'cmms-light' ) ); ?>';setTimeout(function(){b.textContent='<?php echo esc_js( __( 'Copy', 'cmms-light' ) ); ?>';},2000);})(this)">
+                                <?php echo esc_html__( 'Copy', 'cmms-light' ); ?>
+                            </button>
+                        </div>
+                    </div>
+                <?php endif; ?>
+
+                <?php if ( $key_info ) : ?>
+                    <?php // Key exists — show the live integration details. ?>
+                    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px;margin-bottom:12px;">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                            <div style="font-size:12px;font-weight:600;color:#475569;text-transform:uppercase;letter-spacing:0.5px;">
+                                <?php echo esc_html__( 'Status', 'cmms-light' ); ?>
+                            </div>
+                            <span style="display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:600;background:#dcfce7;color:#166534;">
+                                <?php echo esc_html__( 'Active', 'cmms-light' ); ?>
+                            </span>
+                        </div>
+                        <div style="font-size:12px;color:#64748b;line-height:1.6;">
+                            <div><strong><?php echo esc_html__( 'Key', 'cmms-light' ); ?>:</strong> <code style="font-family:monospace;background:#fff;padding:1px 4px;border-radius:3px;"><?php echo esc_html( $key_info->key_prefix ); ?>…</code></div>
+                            <div><strong><?php echo esc_html__( 'Requests', 'cmms-light' ); ?>:</strong> <?php echo (int) $key_info->request_count; ?></div>
+                            <div><strong><?php echo esc_html__( 'Last used', 'cmms-light' ); ?>:</strong> <?php echo $key_info->last_used_at ? esc_html( $key_info->last_used_at ) : esc_html__( 'Never', 'cmms-light' ); ?></div>
+                        </div>
+                    </div>
+
+                    <div class="cmms-field cmms-mb-3">
+                        <label class="cmms-field-label"><?php echo esc_html__( 'Endpoint URL', 'cmms-light' ); ?></label>
+                        <input type="text" class="cmms-input" readonly
+                               value="<?php echo esc_attr( $webhook_url ); ?>"
+                               onclick="this.select();"
+                               style="font-family:monospace;font-size:11px;">
+                    </div>
+
+                    <?php
+                    // ─────────────────────────────────────────────────────────
+                    // Test connection panel (1.14.97)
+                    // ─────────────────────────────────────────────────────────
+                    // The user pastes their API key, clicks "Test connection",
+                    // and we send a POST with "_test": true directly from the
+                    // browser to the webhook endpoint — exactly the same path
+                    // an external client would use. This validates end-to-end:
+                    // the REST route is reachable, the key is correct, and the
+                    // server-side handler returns the expected test response.
+                    // The key is never sent to our own backend — it stays
+                    // in the input field and flows straight to the webhook.
+                    ?>
+                    <div class="cmms-field cmms-mb-3" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:10px 12px;">
+                        <label class="cmms-field-label" style="display:block;margin-bottom:6px;">
+                            🔌 <?php echo esc_html__( 'Test connection', 'cmms-light' ); ?>
+                        </label>
+                        <div style="font-size:11px;color:#64748b;margin-bottom:8px;">
+                            <?php if ( $just_generated_key ) : ?>
+                                <?php echo esc_html__( 'Your new API key is filled in below — just click Test.', 'cmms-light' ); ?>
+                            <?php else : ?>
+                                <?php echo esc_html__( 'Paste an API key and click Test. Sends a real POST with "_test": true — no task is created.', 'cmms-light' ); ?>
+                            <?php endif; ?>
+                        </div>
+                        <div style="display:flex;gap:6px;align-items:stretch;">
+                            <input type="password"
+                                   class="cmms-input cmms-webhook-test-key"
+                                   placeholder="cmms_..."
+                                   value="<?php echo $just_generated_key ? esc_attr( $just_generated_key ) : ''; ?>"
+                                   autocomplete="off"
+                                   spellcheck="false"
+                                   style="flex:1;font-family:monospace;font-size:12px;">
+                            <button type="button"
+                                    class="cmms-btn cmms-btn-sm cmms-btn-primary cmms-webhook-test-btn"
+                                    data-webhook-url="<?php echo esc_attr( $webhook_url ); ?>"
+                                    style="white-space:nowrap;">
+                                <?php echo esc_html__( 'Test', 'cmms-light' ); ?>
+                            </button>
+                        </div>
+                        <div class="cmms-webhook-test-result" style="display:none;margin-top:8px;padding:8px 10px;border-radius:4px;font-size:11px;line-height:1.6;"></div>
+                    </div>
+                    <script>
+                    (function() {
+                        // Global handler — survives multiple webhook sections
+                        // on the same page (each form has its own).
+                        if ( window.__cmmsWebhookTestBound ) return;
+                        window.__cmmsWebhookTestBound = true;
+
+                        document.addEventListener('click', function(e) {
+                            var btn = e.target.closest('.cmms-webhook-test-btn');
+                            if ( ! btn ) return;
+                            e.preventDefault();
+
+                            // The panel that contains this button — we look
+                            // up the key input and result div relative to it,
+                            // so multiple forms on the same page don't collide.
+                            var panel = btn.closest('.cmms-field');
+                            var keyInput = panel.querySelector('.cmms-webhook-test-key');
+                            var resultDiv = panel.querySelector('.cmms-webhook-test-result');
+                            var url = btn.getAttribute('data-webhook-url');
+                            var key = (keyInput.value || '').trim();
+
+                            // ── Validation ──
+                            if ( ! key ) {
+                                showResult(resultDiv, 'warn', '⚠️ ' + 'הדבק מפתח API לפני בדיקה');
+                                keyInput.focus();
+                                return;
+                            }
+
+                            // ── UI state: loading ──
+                            var originalText = btn.textContent;
+                            btn.disabled = true;
+                            btn.textContent = '...';
+                            showResult(resultDiv, 'info', '⏳ שולח בקשת בדיקה...');
+
+                            // ── The actual request ──
+                            // Same path an external client uses: POST with
+                            // Bearer token + _test:true in JSON body.
+                            fetch(url, {
+                                method: 'POST',
+                                headers: {
+                                    'Authorization': 'Bearer ' + key,
+                                    'Content-Type': 'application/json'
+                                },
+                                body: JSON.stringify({ _test: true })
+                            }).then(function(response) {
+                                // Try to parse JSON regardless of status —
+                                // we want the server's message on errors too.
+                                return response.json().then(function(body) {
+                                    return { status: response.status, body: body };
+                                }).catch(function() {
+                                    return { status: response.status, body: null };
+                                });
+                            }).then(function(result) {
+                                renderTestResult(resultDiv, result);
+                            }).catch(function(err) {
+                                // Network error, CORS, DNS, etc.
+                                showResult(resultDiv, 'error',
+                                    '✗ <strong>שגיאת רשת</strong><br>' +
+                                    '<span style="font-size:10px;opacity:0.85;">' +
+                                    'לא ניתן להתחבר ל-endpoint. בדוק שהאתר נגיש ושאין חוסם רשת.' +
+                                    '</span>'
+                                );
+                            }).finally(function() {
+                                btn.disabled = false;
+                                btn.textContent = originalText;
+                            });
+                        });
+
+                        function renderTestResult(div, result) {
+                            var status = result.status;
+                            var body = result.body || {};
+
+                            // ── 200: success ──
+                            if ( status === 200 && body.success ) {
+                                var preview = body.would_create_task || {};
+                                var html = '✅ <strong>החיבור עובד!</strong><br>';
+                                html += '<span style="font-size:10px;opacity:0.85;">';
+                                html += 'הראוט פעיל, ה-API key תקין, השרת מוכן לקבל בקשות.';
+                                html += '</span>';
+                                if ( preview.form_name ) {
+                                    html += '<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(0,0,0,0.1);font-size:10px;">';
+                                    html += '<strong>הטופס שזוהה:</strong> ' + escapeHtml(preview.form_name);
+                                    if ( typeof preview.file_count === 'number' ) {
+                                        html += ' &nbsp;·&nbsp; <strong>שדות שזוהו:</strong> ' +
+                                                (preview.mapped_fields ? Object.keys(preview.mapped_fields).length : 0);
+                                    }
+                                    html += '</div>';
+                                }
+                                showResult(div, 'success', html);
+                                return;
+                            }
+
+                            // ── 401 / 403: auth issue ──
+                            if ( status === 401 || status === 403 ) {
+                                showResult(div, 'error',
+                                    '✗ <strong>מפתח API לא תקין</strong><br>' +
+                                    '<span style="font-size:10px;opacity:0.85;">' +
+                                    'הראוט פעיל, אבל המפתח שהדבקת נדחה. ייתכן שהוא בוטל או הוחלף.' +
+                                    '</span>'
+                                );
+                                return;
+                            }
+
+                            // ── 404: route not registered ──
+                            if ( status === 404 ) {
+                                showResult(div, 'error',
+                                    '✗ <strong>הראוט לא רשום</strong><br>' +
+                                    '<span style="font-size:10px;opacity:0.85;">' +
+                                    'לך ל: <em>הגדרות → קישורים קבועים → שמור</em>. זה ירענן את ה-rewrite rules ויפעיל את הוובהוק.' +
+                                    '</span>'
+                                );
+                                return;
+                            }
+
+                            // ── 400: malformed (shouldn't happen with _test only) ──
+                            if ( status === 400 ) {
+                                var msg = body.message || body.code || 'בקשה לא תקינה';
+                                showResult(div, 'warn',
+                                    '⚠️ <strong>שגיאת בקשה</strong><br>' +
+                                    '<span style="font-size:10px;opacity:0.85;">' + escapeHtml(msg) + '</span>'
+                                );
+                                return;
+                            }
+
+                            // ── Other ──
+                            showResult(div, 'error',
+                                '✗ <strong>שגיאה לא צפויה</strong> (HTTP ' + status + ')<br>' +
+                                '<span style="font-size:10px;opacity:0.85;">' +
+                                escapeHtml(body.message || body.code || 'אין פרטים נוספים') +
+                                '</span>'
+                            );
+                        }
+
+                        function showResult(div, kind, html) {
+                            var styles = {
+                                success: { bg: '#dcfce7', border: '#86efac', color: '#166534' },
+                                error:   { bg: '#fee2e2', border: '#fca5a5', color: '#991b1b' },
+                                warn:    { bg: '#fef3c7', border: '#fcd34d', color: '#92400e' },
+                                info:    { bg: '#dbeafe', border: '#93c5fd', color: '#1e40af' }
+                            };
+                            var s = styles[kind] || styles.info;
+                            div.style.display = 'block';
+                            div.style.background = s.bg;
+                            div.style.border = '1px solid ' + s.border;
+                            div.style.color = s.color;
+                            div.innerHTML = html;
+                        }
+
+                        function escapeHtml(s) {
+                            if ( s == null ) return '';
+                            return String(s)
+                                .replace(/&/g, '&amp;')
+                                .replace(/</g, '&lt;')
+                                .replace(/>/g, '&gt;')
+                                .replace(/"/g, '&quot;')
+                                .replace(/'/g, '&#039;');
+                        }
+                    })();
+                    </script>
+
+                    <details style="margin-bottom:12px;">
+                        <summary style="cursor:pointer;font-weight:600;font-size:13px;color:#0f172a;padding:6px 0;">
+                            📋 <?php echo esc_html__( 'cURL example', 'cmms-light' ); ?>
+                        </summary>
+                        <pre style="background:#0f172a;color:#e2e8f0;padding:10px;border-radius:6px;font-size:11px;overflow-x:auto;margin-top:6px;line-height:1.5;"><code><?php
+                        $curl_example = "curl -X POST '" . esc_html( $webhook_url ) . "' \\\n"
+                            . "  -H 'Authorization: Bearer YOUR_API_KEY' \\\n"
+                            . "  -H 'Content-Type: application/json' \\\n"
+                            . "  -d '" . wp_json_encode( array(
+                                'title'       => 'Example task',
+                                'description' => 'Created via webhook',
+                                'priority'    => 'normal',
+                            ), JSON_UNESCAPED_UNICODE ) . "'";
+                        echo esc_html( $curl_example );
+                        ?></code></pre>
+                    </details>
+
+                    <details style="margin-bottom:12px;">
+                        <summary style="cursor:pointer;font-weight:600;font-size:13px;color:#0f172a;padding:6px 0;">
+                            🗺️ <?php echo esc_html__( 'Accepted fields', 'cmms-light' ); ?>
+                            (<?php echo count( $schema['standard'] ) + count( $schema['dynamic'] ); ?>)
+                        </summary>
+                        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:6px;padding:10px;margin-top:6px;font-size:12px;line-height:1.6;">
+                            <div style="font-weight:600;color:#475569;margin-bottom:4px;">
+                                <?php echo esc_html__( 'Standard fields', 'cmms-light' ); ?>
+                            </div>
+                            <?php foreach ( $schema['standard'] as $entry ) : ?>
+                                <div style="padding:2px 0;">
+                                    <code style="font-family:monospace;background:#f1f5f9;padding:1px 4px;border-radius:3px;"><?php echo esc_html( $entry['key'] ); ?></code>
+                                    <span style="color:#94a3b8;">(<?php echo esc_html( $entry['type'] ); ?>)</span>
+                                    <span style="color:#64748b;display:block;font-size:11px;padding-right:8px;"><?php echo esc_html( $entry['note'] ); ?></span>
+                                </div>
+                            <?php endforeach; ?>
+
+                            <?php if ( ! empty( $schema['dynamic'] ) ) : ?>
+                                <div style="font-weight:600;color:#475569;margin-top:8px;margin-bottom:4px;">
+                                    <?php echo esc_html__( 'Form fields', 'cmms-light' ); ?>
+                                </div>
+                                <?php foreach ( $schema['dynamic'] as $entry ) : ?>
+                                    <div style="padding:2px 0;">
+                                        <code style="font-family:monospace;background:#f1f5f9;padding:1px 4px;border-radius:3px;"><?php echo esc_html( $entry['key'] ); ?></code>
+                                        <span style="color:#94a3b8;">(<?php echo esc_html( $entry['type'] ); ?>)</span>
+                                        <span style="color:#64748b;display:block;font-size:11px;padding-right:8px;">
+                                            <?php echo esc_html( $entry['label'] ); ?>
+                                            <?php if ( ! empty( $entry['accepted_values'] ) ) : ?>
+                                                — <?php echo esc_html( implode( ', ', $entry['accepted_values'] ) ); ?>
+                                            <?php endif; ?>
+                                        </span>
+                                    </div>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
+                        </div>
+                    </details>
+
+                    <details style="margin-bottom:12px;">
+                        <summary style="cursor:pointer;font-weight:600;font-size:13px;color:#0f172a;padding:6px 0;">
+                            👨‍💻 <?php echo esc_html__( 'Integration guide for developers', 'cmms-light' ); ?>
+                        </summary>
+                        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:6px;padding:12px;margin-top:6px;font-size:12px;line-height:1.7;color:#334155;">
+
+                            <?php
+                            // ===== Copy-to-clipboard button =====
+                            // Builds the full integration guide as plain text so the user
+                            // can paste it into WhatsApp/email/Slack to send to a developer.
+                            // We build it server-side (single source of truth — same data
+                            // shown on screen) rather than trying to scrape the rendered HTML.
+                            $guide_text  = "📘 מדריך אינטגרציה - Webhook API\n";
+                            $guide_text .= str_repeat( '=', 50 ) . "\n\n";
+                            $guide_text .= "Endpoint URL:\n" . $webhook_url . "\n\n";
+                            $guide_text .= "Method: POST\n\n";
+                            $guide_text .= "Headers נדרשים:\n";
+                            $guide_text .= "  Authorization: Bearer YOUR_API_KEY\n";
+                            $guide_text .= "  Content-Type: application/json\n\n";
+                            $guide_text .= str_repeat( '-', 50 ) . "\n";
+                            $guide_text .= "קודי תשובה:\n";
+                            $guide_text .= str_repeat( '-', 50 ) . "\n";
+                            $guide_text .= "  200 OK  - המשימה נוצרה. תשובה: {\"success\":true,\"task_id\":123}\n";
+                            $guide_text .= "  400     - JSON לא תקין או שדה לא חוקי\n";
+                            $guide_text .= "  401     - מפתח API חסר או שגוי\n";
+                            $guide_text .= "  403     - הגישה נדחתה (מפתח בוטל)\n";
+                            $guide_text .= "  404     - הטופס לא נמצא\n\n";
+                            $guide_text .= str_repeat( '-', 50 ) . "\n";
+                            $guide_text .= "מצב בדיקה:\n";
+                            $guide_text .= str_repeat( '-', 50 ) . "\n";
+                            $guide_text .= 'הוסף "_test": true ל-JSON כדי לבדוק את החיבור בלי ליצור משימה אמיתית.' . "\n\n";
+                            $guide_text .= str_repeat( '-', 50 ) . "\n";
+                            $guide_text .= "דוגמת cURL:\n";
+                            $guide_text .= str_repeat( '-', 50 ) . "\n";
+                            $guide_text .= "curl -X POST '" . $webhook_url . "' \\\n";
+                            $guide_text .= "  -H 'Authorization: Bearer YOUR_API_KEY' \\\n";
+                            $guide_text .= "  -H 'Content-Type: application/json' \\\n";
+                            $guide_text .= "  -d '{\"title\":\"תקלה חדשה\",\"description\":\"פרטי התקלה\",\"priority\":\"high\"}'\n\n";
+                            $guide_text .= str_repeat( '-', 50 ) . "\n";
+                            $guide_text .= "דוגמת PHP:\n";
+                            $guide_text .= str_repeat( '-', 50 ) . "\n";
+                            $guide_text .= "<?php\n";
+                            $guide_text .= "\$response = wp_remote_post( '" . $webhook_url . "',\n";
+                            $guide_text .= "    array(\n";
+                            $guide_text .= "        'headers' => array(\n";
+                            $guide_text .= "            'Authorization' => 'Bearer YOUR_API_KEY',\n";
+                            $guide_text .= "            'Content-Type'  => 'application/json',\n";
+                            $guide_text .= "        ),\n";
+                            $guide_text .= "        'body' => wp_json_encode( array(\n";
+                            $guide_text .= "            'title'       => 'תקלה חדשה מהפורטל',\n";
+                            $guide_text .= "            'description' => 'פרטי התקלה',\n";
+                            $guide_text .= "            'priority'    => 'high',\n";
+                            $guide_text .= "        ) ),\n";
+                            $guide_text .= "        'timeout' => 15,\n";
+                            $guide_text .= "    )\n";
+                            $guide_text .= ");\n\n";
+                            $guide_text .= str_repeat( '-', 50 ) . "\n";
+                            $guide_text .= "דוגמת JavaScript (Node.js / Browser):\n";
+                            $guide_text .= str_repeat( '-', 50 ) . "\n";
+                            $guide_text .= "const response = await fetch('" . $webhook_url . "', {\n";
+                            $guide_text .= "    method: 'POST',\n";
+                            $guide_text .= "    headers: {\n";
+                            $guide_text .= "        'Authorization': 'Bearer YOUR_API_KEY',\n";
+                            $guide_text .= "        'Content-Type': 'application/json'\n";
+                            $guide_text .= "    },\n";
+                            $guide_text .= "    body: JSON.stringify({\n";
+                            $guide_text .= "        title: 'תקלה חדשה מהפורטל',\n";
+                            $guide_text .= "        description: 'פרטי התקלה',\n";
+                            $guide_text .= "        priority: 'high'\n";
+                            $guide_text .= "    })\n";
+                            $guide_text .= "});\n";
+                            $guide_text .= "const data = await response.json();\n";
+                            $guide_text .= "// data.task_id — מזהה המשימה שנוצרה\n\n";
+                            $guide_text .= str_repeat( '-', 50 ) . "\n";
+                            $guide_text .= "דוגמת Python (requests):\n";
+                            $guide_text .= str_repeat( '-', 50 ) . "\n";
+                            $guide_text .= "import requests\n\n";
+                            $guide_text .= "response = requests.post(\n";
+                            $guide_text .= "    '" . $webhook_url . "',\n";
+                            $guide_text .= "    headers={\n";
+                            $guide_text .= "        'Authorization': 'Bearer YOUR_API_KEY',\n";
+                            $guide_text .= "        'Content-Type': 'application/json'\n";
+                            $guide_text .= "    },\n";
+                            $guide_text .= "    json={\n";
+                            $guide_text .= "        'title': 'תקלה חדשה מהפורטל',\n";
+                            $guide_text .= "        'description': 'פרטי התקלה',\n";
+                            $guide_text .= "        'priority': 'high'\n";
+                            $guide_text .= "    },\n";
+                            $guide_text .= "    timeout=15\n";
+                            $guide_text .= ")\n";
+                            $guide_text .= "task_id = response.json().get('task_id')\n\n";
+                            $guide_text .= str_repeat( '-', 50 ) . "\n";
+                            $guide_text .= "טיפים חשובים:\n";
+                            $guide_text .= str_repeat( '-', 50 ) . "\n";
+                            $guide_text .= "  • אל תחשוף את ה-API key בקוד client (HTML/JS בדפדפן). השתמש בו רק בצד שרת.\n";
+                            $guide_text .= "  • אפשר לשלוח שדות לפי שם השדה (label) או לפי field_<ID>.\n";
+                            $guide_text .= "  • שדות לא מזוהים יחזרו ב-ignored_keys בתשובה — שימושי לדיבוג.\n";
+                            $guide_text .= '  • במצב בדיקה ("_test": true) לא נוצרת משימה ולא נשלחות התראות.' . "\n";
+                            $guide_text .= "  • לקבצים שלח URL ציבורי בשדה הקובץ - השרת יוריד וצרף.\n";
+                            ?>
+
+                            <div style="display:flex;justify-content:flex-end;margin-bottom:12px;">
+                                <button type="button"
+                                        class="cmms-btn cmms-btn-sm cmms-btn-secondary cmms-copy-guide-btn"
+                                        data-guide-text="<?php echo esc_attr( $guide_text ); ?>"
+                                        style="font-size:11px;display:inline-flex;align-items:center;gap:4px;">
+                                    📋 <span class="cmms-copy-guide-label"><?php echo esc_html__( 'Copy full guide', 'cmms-light' ); ?></span>
+                                </button>
+                            </div>
+                            <script>
+                            (function() {
+                                // Single delegated handler — survives re-renders and
+                                // works for multiple forms on the same page (each form
+                                // has its own copy button with its own guide text).
+                                if ( window.__cmmsCopyGuideBound ) return;
+                                window.__cmmsCopyGuideBound = true;
+                                document.addEventListener('click', function(e) {
+                                    var btn = e.target.closest('.cmms-copy-guide-btn');
+                                    if ( ! btn ) return;
+                                    e.preventDefault();
+                                    var text = btn.getAttribute('data-guide-text') || '';
+                                    var label = btn.querySelector('.cmms-copy-guide-label');
+                                    var originalLabel = label ? label.textContent : '';
+                                    var showFeedback = function( msg ) {
+                                        if ( ! label ) return;
+                                        label.textContent = msg;
+                                        setTimeout(function() { label.textContent = originalLabel; }, 2000);
+                                    };
+                                    // Modern clipboard API (requires HTTPS or localhost).
+                                    if ( navigator.clipboard && navigator.clipboard.writeText ) {
+                                        navigator.clipboard.writeText( text ).then(function() {
+                                            showFeedback('✓ הועתק!');
+                                        }).catch(function() {
+                                            // Fallback for permission-denied edge cases.
+                                            fallbackCopy( text, showFeedback );
+                                        });
+                                    } else {
+                                        fallbackCopy( text, showFeedback );
+                                    }
+                                });
+                                // Fallback: textarea + execCommand. Used on non-HTTPS
+                                // installs (some local dev environments) and very old browsers.
+                                function fallbackCopy( text, showFeedback ) {
+                                    var ta = document.createElement('textarea');
+                                    ta.value = text;
+                                    ta.style.position = 'fixed';
+                                    ta.style.left = '-9999px';
+                                    document.body.appendChild(ta);
+                                    ta.select();
+                                    try {
+                                        document.execCommand('copy');
+                                        showFeedback('✓ הועתק!');
+                                    } catch (err) {
+                                        showFeedback('✗ שגיאה');
+                                    }
+                                    document.body.removeChild(ta);
+                                }
+                            })();
+                            </script>
+
+                            <?php // ===== Overview ===== ?>
+                            <div style="background:#eff6ff;border-right:3px solid #3b82f6;padding:8px 10px;border-radius:4px;margin-bottom:12px;">
+                                <div style="font-weight:600;color:#1e40af;margin-bottom:4px;">סקירה כללית</div>
+                                <div style="color:#1e3a8a;font-size:11px;">
+                                    שלח בקשת <code style="background:#dbeafe;padding:1px 4px;border-radius:3px;">POST</code> עם גוף בפורמט JSON ל-endpoint. כל בקשה מוצלחת תיצור משימה חדשה במערכת. נדרש מפתח API ב-header.
+                                </div>
+                            </div>
+
+                            <?php // ===== Endpoint & Auth ===== ?>
+                            <div style="margin-bottom:14px;">
+                                <div style="font-weight:600;color:#0f172a;margin-bottom:4px;font-size:12px;">
+                                    1. כתובת ו-Headers נדרשים
+                                </div>
+                                <div style="margin-bottom:6px;">
+                                    <code style="background:#f1f5f9;padding:2px 6px;border-radius:3px;font-size:11px;">POST <?php echo esc_html( $webhook_url ); ?></code>
+                                </div>
+                                <div style="font-size:11px;color:#475569;">חובה לשלוח שני headers:</div>
+                                <pre style="background:#0f172a;color:#e2e8f0;padding:8px 10px;border-radius:4px;font-size:11px;margin:4px 0 0 0;overflow-x:auto;direction:ltr;text-align:left;"><code>Authorization: Bearer YOUR_API_KEY
+Content-Type: application/json</code></pre>
+                            </div>
+
+                            <?php // ===== Response codes ===== ?>
+                            <div style="margin-bottom:14px;">
+                                <div style="font-weight:600;color:#0f172a;margin-bottom:4px;font-size:12px;">
+                                    2. קודי תשובה
+                                </div>
+                                <div style="font-size:11px;">
+                                    <div style="padding:3px 0;">
+                                        <code style="background:#dcfce7;color:#166534;padding:1px 6px;border-radius:3px;font-weight:600;">200 OK</code>
+                                        — המשימה נוצרה. גוף התשובה: <code style="background:#f1f5f9;padding:1px 4px;border-radius:3px;">{"success":true,"task_id":123}</code>
+                                    </div>
+                                    <div style="padding:3px 0;">
+                                        <code style="background:#fef3c7;color:#92400e;padding:1px 6px;border-radius:3px;font-weight:600;">400</code>
+                                        — JSON לא תקין או שדה לא חוקי
+                                    </div>
+                                    <div style="padding:3px 0;">
+                                        <code style="background:#fee2e2;color:#991b1b;padding:1px 6px;border-radius:3px;font-weight:600;">401</code>
+                                        — מפתח API חסר או שגוי
+                                    </div>
+                                    <div style="padding:3px 0;">
+                                        <code style="background:#fee2e2;color:#991b1b;padding:1px 6px;border-radius:3px;font-weight:600;">403</code>
+                                        — הגישה נדחתה (מפתח בוטל)
+                                    </div>
+                                    <div style="padding:3px 0;">
+                                        <code style="background:#fee2e2;color:#991b1b;padding:1px 6px;border-radius:3px;font-weight:600;">404</code>
+                                        — הטופס לא נמצא
+                                    </div>
+                                </div>
+                            </div>
+
+                            <?php // ===== Test mode ===== ?>
+                            <div style="margin-bottom:14px;">
+                                <div style="font-weight:600;color:#0f172a;margin-bottom:4px;font-size:12px;">
+                                    3. מצב בדיקה
+                                </div>
+                                <div style="font-size:11px;color:#475569;">
+                                    הוסף <code style="background:#f1f5f9;padding:1px 4px;border-radius:3px;">"_test": true</code> ל-JSON כדי לבדוק את החיבור בלי ליצור משימה אמיתית. תקבל תשובה שמראה איך המערכת פירשה את הנתונים שלך.
+                                </div>
+                            </div>
+
+                            <?php // ===== Examples in different languages ===== ?>
+                            <div style="margin-bottom:14px;">
+                                <div style="font-weight:600;color:#0f172a;margin-bottom:6px;font-size:12px;">
+                                    4. דוגמאות קוד
+                                </div>
+
+                                <?php // ----- PHP example ----- ?>
+                                <div style="font-size:11px;color:#475569;margin:8px 0 4px 0;font-weight:600;">PHP</div>
+                                <pre style="background:#0f172a;color:#e2e8f0;padding:10px;border-radius:4px;font-size:11px;overflow-x:auto;margin:0;line-height:1.5;direction:ltr;text-align:left;"><code><?php
+$php_example = '<?php' . "\n"
+    . '$response = wp_remote_post( ' . "'" . esc_html( $webhook_url ) . "',\n"
+    . '    array(' . "\n"
+    . '        \'headers\' => array(' . "\n"
+    . '            \'Authorization\' => \'Bearer YOUR_API_KEY\',' . "\n"
+    . '            \'Content-Type\'  => \'application/json\',' . "\n"
+    . '        ),' . "\n"
+    . '        \'body\' => wp_json_encode( array(' . "\n"
+    . '            \'title\'       => \'תקלה חדשה מהפורטל\',' . "\n"
+    . '            \'description\' => \'פרטי התקלה\',' . "\n"
+    . '            \'priority\'    => \'high\',' . "\n"
+    . '        ) ),' . "\n"
+    . '        \'timeout\' => 15,' . "\n"
+    . '    )' . "\n"
+    . ');' . "\n\n"
+    . 'if ( is_wp_error( $response ) ) {' . "\n"
+    . '    error_log( $response->get_error_message() );' . "\n"
+    . '} else {' . "\n"
+    . '    $body = json_decode( wp_remote_retrieve_body( $response ), true );' . "\n"
+    . '    // $body[\'task_id\'] — מזהה המשימה שנוצרה' . "\n"
+    . '}';
+echo esc_html( $php_example );
+?></code></pre>
+
+                                <?php // ----- JavaScript example ----- ?>
+                                <div style="font-size:11px;color:#475569;margin:10px 0 4px 0;font-weight:600;">JavaScript (Node.js / Browser)</div>
+                                <pre style="background:#0f172a;color:#e2e8f0;padding:10px;border-radius:4px;font-size:11px;overflow-x:auto;margin:0;line-height:1.5;direction:ltr;text-align:left;"><code><?php
+$js_example = "const response = await fetch('" . esc_html( $webhook_url ) . "', {\n"
+    . "  method: 'POST',\n"
+    . "  headers: {\n"
+    . "    'Authorization': 'Bearer YOUR_API_KEY',\n"
+    . "    'Content-Type': 'application/json'\n"
+    . "  },\n"
+    . "  body: JSON.stringify({\n"
+    . "    title: 'תקלה חדשה מהפורטל',\n"
+    . "    description: 'פרטי התקלה',\n"
+    . "    priority: 'high'\n"
+    . "  })\n"
+    . "});\n\n"
+    . "const data = await response.json();\n"
+    . "console.log('Task ID:', data.task_id);";
+echo esc_html( $js_example );
+?></code></pre>
+
+                                <?php // ----- Python example ----- ?>
+                                <div style="font-size:11px;color:#475569;margin:10px 0 4px 0;font-weight:600;">Python</div>
+                                <pre style="background:#0f172a;color:#e2e8f0;padding:10px;border-radius:4px;font-size:11px;overflow-x:auto;margin:0;line-height:1.5;direction:ltr;text-align:left;"><code><?php
+$py_example = "import requests\n\n"
+    . "response = requests.post(\n"
+    . "    '" . esc_html( $webhook_url ) . "',\n"
+    . "    headers={\n"
+    . "        'Authorization': 'Bearer YOUR_API_KEY',\n"
+    . "        'Content-Type': 'application/json'\n"
+    . "    },\n"
+    . "    json={\n"
+    . "        'title': 'תקלה חדשה מהפורטל',\n"
+    . "        'description': 'פרטי התקלה',\n"
+    . "        'priority': 'high'\n"
+    . "    },\n"
+    . "    timeout=15\n"
+    . ")\n\n"
+    . "data = response.json()\n"
+    . "print('Task ID:', data['task_id'])";
+echo esc_html( $py_example );
+?></code></pre>
+                            </div>
+
+                            <?php // ===== Tips ===== ?>
+                            <div style="background:#fefce8;border-right:3px solid #eab308;padding:8px 10px;border-radius:4px;">
+                                <div style="font-weight:600;color:#854d0e;margin-bottom:4px;">💡 טיפים חשובים</div>
+                                <ul style="margin:0;padding-right:18px;color:#713f12;font-size:11px;">
+                                    <li>אל תחשוף את מפתח ה-API בקוד client-side (דפדפן/אפליקציה). השתמש בו רק בשרת.</li>
+                                    <li>כל שדה מותר להישלח גם לפי <code style="background:#fef3c7;padding:1px 4px;border-radius:3px;">field_ID</code> וגם לפי שם השדה (כפי שמופיע ברשימת השדות למעלה).</li>
+                                    <li>שדות לא מזוהים יוחזרו ברשימת <code style="background:#fef3c7;padding:1px 4px;border-radius:3px;">ignored_keys</code> בתשובה — שימושי לדיבוג.</li>
+                                    <li>במצב בדיקה (<code style="background:#fef3c7;padding:1px 4px;border-radius:3px;">_test: true</code>) לא נוצרת משימה ולא נשלחות התראות.</li>
+                                    <li>הקובץ צריך להישלח כ-URL ציבורי בשדה הקובץ — השרת יוריד אותו ויצרף אותו למשימה.</li>
+                                </ul>
+                            </div>
+
+                        </div>
+                    </details>
+
+                    <div style="display:flex;gap:8px;">
+                        <form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" style="flex:1;"
+                              onsubmit="return confirm('<?php echo esc_js( __( 'Generate a new key? The current key will stop working immediately.', 'cmms-light' ) ); ?>');">
+                            <input type="hidden" name="action" value="cmms_webhook_rotate">
+                            <input type="hidden" name="form_id" value="<?php echo (int) $form->id; ?>">
+                            <?php wp_nonce_field( 'cmms_webhook_rotate', 'cmms_webhook_rotate_nonce' ); ?>
+                            <button type="submit" class="cmms-btn cmms-btn-sm cmms-btn-secondary" style="width:100%;">
+                                <?php CMMS_Icons::e( 'refresh-cw', 14 ); ?>
+                                <?php echo esc_html__( 'Rotate key', 'cmms-light' ); ?>
+                            </button>
+                        </form>
+                        <form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" style="flex:1;"
+                              onsubmit="return confirm('<?php echo esc_js( __( 'Revoke this key? External integrations using it will stop working.', 'cmms-light' ) ); ?>');">
+                            <input type="hidden" name="action" value="cmms_webhook_revoke">
+                            <input type="hidden" name="form_id" value="<?php echo (int) $form->id; ?>">
+                            <?php wp_nonce_field( 'cmms_webhook_revoke', 'cmms_webhook_revoke_nonce' ); ?>
+                            <button type="submit" class="cmms-btn cmms-btn-sm cmms-btn-ghost" style="width:100%;color:#b91c1c;">
+                                <?php CMMS_Icons::e( 'x-circle', 14 ); ?>
+                                <?php echo esc_html__( 'Revoke', 'cmms-light' ); ?>
+                            </button>
+                        </form>
+                    </div>
+
+                    <?php
+                    // ─────────────────────────────────────────────────────────
+                    // Destructive-action warning (1.14.97)
+                    // ─────────────────────────────────────────────────────────
+                    // Both Rotate and Revoke break running integrations
+                    // instantly. Users need to know what each one does and
+                    // when to use it BEFORE clicking — the confirm() dialog
+                    // alone isn't enough context.
+                    ?>
+                    <div style="margin-top:10px;background:#fef3c7;border:1px solid #fcd34d;border-radius:6px;padding:10px 12px;font-size:11px;line-height:1.6;color:#78350f;">
+                        <div style="font-weight:600;margin-bottom:6px;display:flex;align-items:center;gap:4px;">
+                            ⚠️ <?php echo esc_html__( 'Important — these actions break running integrations', 'cmms-light' ); ?>
+                        </div>
+                        <div style="margin-bottom:5px;">
+                            <strong><?php echo esc_html__( 'Rotate key', 'cmms-light' ); ?>:</strong>
+                            <?php echo esc_html__( 'cancels the current key and creates a new one. Use this when the key may have leaked, after staff turnover, or for periodic security refresh. You\'ll need to send the new key to anyone using the integration.', 'cmms-light' ); ?>
+                        </div>
+                        <div style="margin-bottom:5px;">
+                            <strong><?php echo esc_html__( 'Revoke', 'cmms-light' ); ?>:</strong>
+                            <?php echo esc_html__( 'cancels the key without creating a new one. The webhook stops accepting requests entirely. Use this when ending a partnership or to immediately block a suspected leak.', 'cmms-light' ); ?>
+                        </div>
+                        <div style="margin-top:8px;padding-top:6px;border-top:1px solid #fcd34d;font-size:10px;">
+                            💡 <?php echo esc_html__( 'Before rotating: make sure you have a fast way to deliver the new key to whoever is using the integration. Until they update it, their requests will return 401.', 'cmms-light' ); ?>
+                        </div>
+                    </div>
+
+                <?php else : ?>
+                    <?php // No key issued yet — single CTA. ?>
+                    <form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>">
+                        <input type="hidden" name="action" value="cmms_webhook_generate">
+                        <input type="hidden" name="form_id" value="<?php echo (int) $form->id; ?>">
+                        <?php wp_nonce_field( 'cmms_webhook_generate', 'cmms_webhook_generate_nonce' ); ?>
+                        <button type="submit" class="cmms-btn cmms-btn-primary" style="width:100%;">
+                            <?php CMMS_Icons::e( 'zap', 16 ); ?>
+                            <?php echo esc_html__( 'Generate API key', 'cmms-light' ); ?>
+                        </button>
+                    </form>
+                <?php endif; ?>
+            </div>
+        </section>
+        <?php
+    }
+
+    /**
+     * 1.14.99: Render the Email-to-Task section in the form-edit page.
+     * Same shape as the webhook section. Two states:
+     *
+     *  - No route: a single "Create email address" button.
+     *  - Route exists: shows the public address, status, copy button,
+     *                  Test panel, and rotate/revoke controls.
+     *
+     * The email address is NOT a secret (unlike webhook keys) — it's
+     * the public local-part of the address users will forward emails
+     * to. So we show it in plain text, no transient/one-time reveal.
+     */
+    private function render_form_email_inbox_section( $form ) {
+        if ( ! CMMS_Auth::can( 'manage_forms' ) ) return;
+
+        $route = CMMS_Email_Inbox::get_route_info( $form->id );
+        $email_address = $route ? CMMS_Email_Inbox::email_address( $route ) : '';
+        ?>
+        <section class="cmms-section" style="margin-top:16px;">
+            <div class="cmms-section-head">
+                <h3 class="cmms-section-title">
+                    <?php CMMS_Icons::e( 'mail', 16 ); ?>
+                    <?php echo esc_html__( 'Email-to-Task', 'cmms-light' ); ?>
+                </h3>
+            </div>
+            <div class="cmms-section-body">
+                <p class="cmms-text-sm cmms-mb-3" style="color:#475569;">
+                    <?php echo esc_html__( 'Forward emails to a dedicated address and they will be turned into tasks automatically. The subject becomes the title, the body becomes the description, and attachments are saved with the task.', 'cmms-light' ); ?>
+                </p>
+
+                <?php if ( $route ) : ?>
+                    <?php
+                    // ── Status badge ──
+                    $status_class = $route->enabled ? 'background:#dcfce7;color:#166534;' : 'background:#fee2e2;color:#991b1b;';
+                    $status_text  = $route->enabled ? __( 'Active', 'cmms-light' ) : __( 'Disabled', 'cmms-light' );
+                    ?>
+                    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:10px 12px;margin-bottom:12px;font-size:12px;">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                            <span style="padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;<?php echo esc_attr( $status_class ); ?>"><?php echo esc_html( $status_text ); ?></span>
+                            <strong><?php echo esc_html__( 'STATUS', 'cmms-light' ); ?></strong>
+                        </div>
+                        <div style="color:#475569;line-height:1.7;">
+                            <div><strong><?php echo esc_html__( 'Created', 'cmms-light' ); ?>:</strong> <?php echo esc_html( $route->created_at ); ?></div>
+                            <div><strong><?php echo esc_html__( 'Emails received', 'cmms-light' ); ?>:</strong> <?php echo (int) $route->request_count; ?></div>
+                            <div><strong><?php echo esc_html__( 'Last email', 'cmms-light' ); ?>:</strong> <?php echo $route->last_used_at ? esc_html( $route->last_used_at ) : esc_html__( 'Never', 'cmms-light' ); ?></div>
+                        </div>
+                        <?php // 1.15.5: Link to the dedicated inbound log, filtered to this form. ?>
+                        <div style="margin-top:8px;padding-top:8px;border-top:1px solid #e2e8f0;">
+                            <a href="<?php echo esc_url( $this->url( array( 'view' => 'email_log', 'form_id' => (int) $form->id ) ) ); ?>"
+                               style="font-size:12px;color:#0369a1;text-decoration:none;font-weight:600;">
+                                📥 <?php esc_html_e( 'צפה במיילים שהתקבלו בטופס זה', 'cmms-light' ); ?> ←
+                            </a>
+                        </div>
+                    </div>
+
+                    <?php // ── The email address (the main thing) ── ?>
+                    <div class="cmms-field cmms-mb-3">
+                        <label class="cmms-field-label">
+                            📧 <?php echo esc_html__( 'Email address — forward emails here', 'cmms-light' ); ?>
+                        </label>
+                        <div style="display:flex;gap:6px;align-items:stretch;">
+                            <input type="text"
+                                   class="cmms-input cmms-email-inbox-address"
+                                   readonly
+                                   value="<?php echo esc_attr( $email_address ); ?>"
+                                   onclick="this.select();"
+                                   style="flex:1;font-family:monospace;font-size:12px;background:#fff;">
+                            <button type="button"
+                                    class="cmms-btn cmms-btn-sm cmms-btn-secondary cmms-email-inbox-copy-btn"
+                                    data-address="<?php echo esc_attr( $email_address ); ?>"
+                                    style="white-space:nowrap;">
+                                <span class="cmms-email-inbox-copy-label">📋 <?php echo esc_html__( 'Copy', 'cmms-light' ); ?></span>
+                            </button>
+                        </div>
+                        <div style="font-size:11px;color:#64748b;margin-top:6px;">
+                            <?php echo esc_html__( 'Send or forward any email to this address — a task will be created automatically.', 'cmms-light' ); ?>
+                        </div>
+                    </div>
+
+                    <?php // ── Two ways to use it ── ?>
+                    <details style="margin-bottom:12px;">
+                        <summary style="cursor:pointer;font-weight:600;font-size:13px;color:#0f172a;padding:6px 0;">
+                            💡 <?php echo esc_html__( 'How to use it (2 ways)', 'cmms-light' ); ?>
+                        </summary>
+                        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:6px;padding:12px;margin-top:6px;font-size:12px;line-height:1.7;color:#334155;">
+
+                            <?php // ===== Way 1: Manual forwarding ===== ?>
+                            <div style="margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid #e2e8f0;">
+                                <div style="font-weight:600;color:#0f172a;margin-bottom:4px;">
+                                    <?php echo esc_html__( '1. Manual forwarding (no setup needed)', 'cmms-light' ); ?>
+                                </div>
+                                <div style="font-size:11px;color:#475569;">
+                                    <?php echo esc_html__( 'Got an email about an issue? Forward it to this address. A task will be created with the subject as the title and the body as the description.', 'cmms-light' ); ?>
+                                </div>
+                            </div>
+
+                            <?php // ===== Way 2: Automatic forwarding ===== ?>
+                            <div>
+                                <div style="font-weight:600;color:#0f172a;margin-bottom:6px;">
+                                    <?php echo esc_html__( '2. Automatic forwarding (setup once, runs forever)', 'cmms-light' ); ?>
+                                </div>
+                                <div style="font-size:11px;color:#475569;margin-bottom:10px;">
+                                    <?php echo esc_html__( 'Forward every email arriving at your support address (e.g. support@yourcompany.com) to this address. Choose your email provider:', 'cmms-light' ); ?>
+                                </div>
+
+                                <?php
+                                // ── Build the per-provider instructions as
+                                // plain text. We render them on screen, AND
+                                // make them copyable so the user can send
+                                // them to a customer/IT person.
+                                // ──
+                                // The customer needs to know the destination
+                                // address — we embed it in each instruction
+                                // so they don't have to remember where they
+                                // got it from.
+                                $gmail_steps_text  = "📧 הוראות הגדרת forwarding ב-Gmail\n";
+                                $gmail_steps_text .= str_repeat( '=', 50 ) . "\n\n";
+                                $gmail_steps_text .= "כתובת היעד (העבר את כל המיילים לכאן):\n";
+                                $gmail_steps_text .= $email_address . "\n\n";
+                                $gmail_steps_text .= "שלבים:\n";
+                                $gmail_steps_text .= "1. היכנס לג'ימייל בדפדפן (לא באפליקציה)\n";
+                                $gmail_steps_text .= "2. לחץ על גלגל השיניים (⚙) בפינה הימנית העליונה\n";
+                                $gmail_steps_text .= "   ובחר 'See all settings' / 'הצג את כל ההגדרות'\n";
+                                $gmail_steps_text .= "3. עבור לטאב 'Forwarding and POP/IMAP' /\n";
+                                $gmail_steps_text .= "   'העברה ו-POP/IMAP'\n";
+                                $gmail_steps_text .= "4. לחץ 'Add a forwarding address' /\n";
+                                $gmail_steps_text .= "   'הוסף כתובת העברה'\n";
+                                $gmail_steps_text .= "5. הדבק את כתובת היעד:\n";
+                                $gmail_steps_text .= "   " . $email_address . "\n";
+                                $gmail_steps_text .= "6. גוגל ישלח מייל אישור לכתובת היעד.\n";
+                                $gmail_steps_text .= "   ⚠️ חשוב: תצטרך לבקש את קוד האישור מנותן השירות\n";
+                                $gmail_steps_text .= "   (CMMS Light) שיאמת את כתובת היעד.\n";
+                                $gmail_steps_text .= "7. אחרי האישור, חזור להגדרות וסמן\n";
+                                $gmail_steps_text .= "   'Forward a copy of incoming mail to...'\n";
+                                $gmail_steps_text .= "8. שמור את השינויים בתחתית הדף\n\n";
+                                $gmail_steps_text .= "טיפ: אם רוצים להעביר רק חלק מהמיילים\n";
+                                $gmail_steps_text .= "(למשל לפי נושא או שולח) - השתמש בפילטרים:\n";
+                                $gmail_steps_text .= "Settings → Filters and Blocked Addresses →\n";
+                                $gmail_steps_text .= "Create a new filter → בחר 'Forward it to:'\n";
+
+                                $outlook_steps_text  = "📧 הוראות הגדרת forwarding ב-Outlook\n";
+                                $outlook_steps_text .= str_repeat( '=', 50 ) . "\n\n";
+                                $outlook_steps_text .= "כתובת היעד:\n";
+                                $outlook_steps_text .= $email_address . "\n\n";
+                                $outlook_steps_text .= "שלבים (Outlook 365 / Outlook.com):\n";
+                                $outlook_steps_text .= "1. היכנס ל-Outlook בדפדפן\n";
+                                $outlook_steps_text .= "2. לחץ על גלגל השיניים (⚙) בפינה הימנית\n";
+                                $outlook_steps_text .= "   העליונה ובחר 'View all Outlook settings'\n";
+                                $outlook_steps_text .= "3. Mail → Forwarding\n";
+                                $outlook_steps_text .= "4. סמן 'Enable forwarding'\n";
+                                $outlook_steps_text .= "5. הדבק את כתובת היעד:\n";
+                                $outlook_steps_text .= "   " . $email_address . "\n";
+                                $outlook_steps_text .= "6. (מומלץ) סמן גם 'Keep a copy of forwarded\n";
+                                $outlook_steps_text .= "   messages' כדי שעותק יישאר אצלך\n";
+                                $outlook_steps_text .= "7. Save\n\n";
+                                $outlook_steps_text .= "Outlook עם Exchange ארגוני:\n";
+                                $outlook_steps_text .= "Settings → Mail → Rules → Add new rule →\n";
+                                $outlook_steps_text .= "Action: Forward to → " . $email_address . "\n";
+
+                                $other_steps_text  = "📧 העברה אוטומטית במערכות אחרות\n";
+                                $other_steps_text .= str_repeat( '=', 50 ) . "\n\n";
+                                $other_steps_text .= "כתובת היעד:\n";
+                                $other_steps_text .= $email_address . "\n\n";
+                                $other_steps_text .= "כל מערכת דואר תומכת ב-forwarding.\n";
+                                $other_steps_text .= "חפש את ההגדרה תחת אחד מהמונחים:\n\n";
+                                $other_steps_text .= "  - Forwarding\n";
+                                $other_steps_text .= "  - Auto-forward\n";
+                                $other_steps_text .= "  - Mail forwarding rules\n";
+                                $other_steps_text .= "  - העברה / העברה אוטומטית\n\n";
+                                $other_steps_text .= "במערכות מסוימות נדרש אישור הכתובת לפני\n";
+                                $other_steps_text .= "ההפעלה - אם תקבל בקשה לקוד אישור,\n";
+                                $other_steps_text .= "פנה לנותן השירות.\n";
+                                ?>
+
+                                <?php // ── Provider tabs ── ?>
+                                <div class="cmms-email-tabs" style="display:flex;gap:4px;margin-bottom:8px;">
+                                    <button type="button"
+                                            class="cmms-email-tab-btn cmms-active"
+                                            data-tab="gmail"
+                                            style="flex:1;padding:6px 8px;border:1px solid #e2e8f0;background:#fff;border-radius:4px;font-size:11px;cursor:pointer;font-weight:600;">
+                                        Gmail
+                                    </button>
+                                    <button type="button"
+                                            class="cmms-email-tab-btn"
+                                            data-tab="outlook"
+                                            style="flex:1;padding:6px 8px;border:1px solid #e2e8f0;background:#fff;border-radius:4px;font-size:11px;cursor:pointer;">
+                                        Outlook
+                                    </button>
+                                    <button type="button"
+                                            class="cmms-email-tab-btn"
+                                            data-tab="other"
+                                            style="flex:1;padding:6px 8px;border:1px solid #e2e8f0;background:#fff;border-radius:4px;font-size:11px;cursor:pointer;">
+                                        <?php echo esc_html__( 'Other', 'cmms-light' ); ?>
+                                    </button>
+                                </div>
+
+                                <?php // ── Gmail panel ── ?>
+                                <div class="cmms-email-tab-panel cmms-email-tab-gmail" style="display:block;background:#f8fafc;border:1px solid #e2e8f0;border-radius:4px;padding:10px;font-size:11px;line-height:1.6;">
+                                    <ol style="margin:0;padding-right:18px;color:#334155;">
+                                        <li><?php echo esc_html__( 'Sign in to Gmail in a web browser (not the app)', 'cmms-light' ); ?></li>
+                                        <li><?php echo esc_html__( 'Click the gear icon ⚙ → "See all settings"', 'cmms-light' ); ?></li>
+                                        <li><?php echo esc_html__( 'Go to the "Forwarding and POP/IMAP" tab', 'cmms-light' ); ?></li>
+                                        <li><?php echo esc_html__( 'Click "Add a forwarding address" and paste the address above', 'cmms-light' ); ?></li>
+                                        <li><?php echo esc_html__( 'Google will send a verification email. Contact your service provider for the verification code.', 'cmms-light' ); ?></li>
+                                        <li><?php echo esc_html__( 'After verification, select "Forward a copy of incoming mail to..." and save', 'cmms-light' ); ?></li>
+                                    </ol>
+                                    <div style="margin-top:8px;padding:6px 8px;background:#dbeafe;border-radius:3px;color:#1e40af;font-size:10px;">
+                                        💡 <?php echo esc_html__( 'Tip: To forward only specific emails, use Gmail filters: Settings → Filters and Blocked Addresses → Create a new filter.', 'cmms-light' ); ?>
+                                    </div>
+                                </div>
+
+                                <?php // ── Outlook panel ── ?>
+                                <div class="cmms-email-tab-panel cmms-email-tab-outlook" style="display:none;background:#f8fafc;border:1px solid #e2e8f0;border-radius:4px;padding:10px;font-size:11px;line-height:1.6;">
+                                    <div style="font-weight:600;margin-bottom:4px;color:#0f172a;">Outlook 365 / Outlook.com</div>
+                                    <ol style="margin:0 0 10px 0;padding-right:18px;color:#334155;">
+                                        <li><?php echo esc_html__( 'Sign in to Outlook in a web browser', 'cmms-light' ); ?></li>
+                                        <li><?php echo esc_html__( 'Click the gear icon ⚙ → "View all Outlook settings"', 'cmms-light' ); ?></li>
+                                        <li><?php echo esc_html__( 'Mail → Forwarding', 'cmms-light' ); ?></li>
+                                        <li><?php echo esc_html__( 'Check "Enable forwarding" and paste the address above', 'cmms-light' ); ?></li>
+                                        <li><?php echo esc_html__( 'Recommended: also check "Keep a copy of forwarded messages"', 'cmms-light' ); ?></li>
+                                        <li><?php echo esc_html__( 'Save', 'cmms-light' ); ?></li>
+                                    </ol>
+                                    <div style="font-weight:600;margin-bottom:4px;color:#0f172a;"><?php echo esc_html__( 'Outlook with corporate Exchange', 'cmms-light' ); ?></div>
+                                    <div style="color:#475569;">
+                                        <?php echo esc_html__( 'Settings → Mail → Rules → Add new rule → Action: Forward to → paste the address.', 'cmms-light' ); ?>
+                                    </div>
+                                </div>
+
+                                <?php // ── Other panel ── ?>
+                                <div class="cmms-email-tab-panel cmms-email-tab-other" style="display:none;background:#f8fafc;border:1px solid #e2e8f0;border-radius:4px;padding:10px;font-size:11px;line-height:1.6;color:#334155;">
+                                    <p style="margin:0 0 8px 0;">
+                                        <?php echo esc_html__( 'Most email systems support forwarding. Look for one of these settings:', 'cmms-light' ); ?>
+                                    </p>
+                                    <ul style="margin:0;padding-right:18px;">
+                                        <li>Forwarding</li>
+                                        <li>Auto-forward</li>
+                                        <li>Mail forwarding rules</li>
+                                        <li><?php echo esc_html__( 'העברה / העברה אוטומטית', 'cmms-light' ); ?></li>
+                                    </ul>
+                                    <div style="margin-top:8px;padding:6px 8px;background:#fef3c7;border-radius:3px;color:#78350f;font-size:10px;">
+                                        ⚠️ <?php echo esc_html__( 'Some systems require address verification before activation. If you get a verification request, contact your service provider.', 'cmms-light' ); ?>
+                                    </div>
+                                </div>
+
+                                <?php // ── Copy instructions button ── ?>
+                                <div style="margin-top:10px;display:flex;justify-content:flex-end;">
+                                    <button type="button"
+                                            class="cmms-btn cmms-btn-sm cmms-btn-secondary cmms-email-copy-instructions-btn"
+                                            data-gmail="<?php echo esc_attr( $gmail_steps_text ); ?>"
+                                            data-outlook="<?php echo esc_attr( $outlook_steps_text ); ?>"
+                                            data-other="<?php echo esc_attr( $other_steps_text ); ?>"
+                                            style="font-size:11px;display:inline-flex;align-items:center;gap:4px;">
+                                        📋 <span class="cmms-email-copy-instructions-label"><?php echo esc_html__( 'Copy instructions to send to customer', 'cmms-light' ); ?></span>
+                                    </button>
+                                </div>
+
+                                <script>
+                                (function() {
+                                    if ( window.__cmmsEmailTabsBound ) return;
+                                    window.__cmmsEmailTabsBound = true;
+
+                                    // ── Tab switching ──
+                                    document.addEventListener('click', function(e) {
+                                        var tabBtn = e.target.closest('.cmms-email-tab-btn');
+                                        if ( tabBtn ) {
+                                            e.preventDefault();
+                                            var container = tabBtn.closest('details') || document;
+                                            var tab = tabBtn.getAttribute('data-tab');
+                                            // Active state on buttons
+                                            container.querySelectorAll('.cmms-email-tab-btn').forEach(function(b) {
+                                                b.classList.remove('cmms-active');
+                                                b.style.background = '#fff';
+                                                b.style.fontWeight = 'normal';
+                                            });
+                                            tabBtn.classList.add('cmms-active');
+                                            tabBtn.style.background = '#eff6ff';
+                                            tabBtn.style.fontWeight = '600';
+                                            // Show/hide panels
+                                            container.querySelectorAll('.cmms-email-tab-panel').forEach(function(p) {
+                                                p.style.display = 'none';
+                                            });
+                                            var panel = container.querySelector('.cmms-email-tab-' + tab);
+                                            if ( panel ) panel.style.display = 'block';
+                                            return;
+                                        }
+
+                                        // ── Copy instructions button ──
+                                        // Copies the CURRENTLY ACTIVE tab's
+                                        // instructions to clipboard. So if
+                                        // user is on Gmail tab, they get
+                                        // Gmail instructions — what they see
+                                        // matches what they get.
+                                        var copyBtn = e.target.closest('.cmms-email-copy-instructions-btn');
+                                        if ( ! copyBtn ) return;
+                                        e.preventDefault();
+
+                                        var container = copyBtn.closest('details') || document;
+                                        var activeBtn = container.querySelector('.cmms-email-tab-btn.cmms-active');
+                                        var tab = activeBtn ? activeBtn.getAttribute('data-tab') : 'gmail';
+                                        var text = copyBtn.getAttribute('data-' + tab) || '';
+
+                                        var label = copyBtn.querySelector('.cmms-email-copy-instructions-label');
+                                        var original = label ? label.textContent : '';
+                                        var done = function() {
+                                            if ( label ) {
+                                                label.textContent = '✓ הועתק!';
+                                                setTimeout(function() { label.textContent = original; }, 2000);
+                                            }
+                                        };
+                                        if ( navigator.clipboard && navigator.clipboard.writeText ) {
+                                            navigator.clipboard.writeText( text ).then( done ).catch(function() {
+                                                fallbackCopyInstr( text, done );
+                                            });
+                                        } else {
+                                            fallbackCopyInstr( text, done );
+                                        }
+                                    });
+
+                                    function fallbackCopyInstr( text, done ) {
+                                        var ta = document.createElement('textarea');
+                                        ta.value = text;
+                                        ta.style.position = 'fixed';
+                                        ta.style.left = '-9999px';
+                                        document.body.appendChild(ta);
+                                        ta.select();
+                                        try { document.execCommand('copy'); } catch (err) {}
+                                        document.body.removeChild(ta);
+                                        done();
+                                    }
+                                })();
+                                </script>
+
+                            </div>
+                        </div>
+                    </details>
+
+                    <?php
+                    // ── Test panel (1.14.99) ──
+                    // Sends a real POST with _test:true to the email-inbox
+                    // endpoint. Same idea as the webhook test panel, but
+                    // for the email route. Simulates a single email arrival.
+                    ?>
+                    <div class="cmms-field cmms-mb-3" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:10px 12px;">
+                        <label class="cmms-field-label" style="display:block;margin-bottom:6px;">
+                            🔌 <?php echo esc_html__( 'Test connection', 'cmms-light' ); ?>
+                        </label>
+                        <div style="font-size:11px;color:#64748b;margin-bottom:8px;">
+                            <?php echo esc_html__( 'Sends a simulated email to the endpoint — no real task is created.', 'cmms-light' ); ?>
+                        </div>
+                        <?php
+                        $email_inbox_url = rest_url( 'cmms-light/v1/email-inbox/' . $route->email_slug );
+                        ?>
+                        <button type="button"
+                                class="cmms-btn cmms-btn-sm cmms-btn-primary cmms-email-inbox-test-btn"
+                                data-endpoint-url="<?php echo esc_attr( $email_inbox_url ); ?>"
+                                style="width:100%;">
+                            <?php echo esc_html__( 'Test', 'cmms-light' ); ?>
+                        </button>
+                        <div class="cmms-email-inbox-test-result" style="display:none;margin-top:8px;padding:8px 10px;border-radius:4px;font-size:11px;line-height:1.6;"></div>
+                    </div>
+
+                    <script>
+                    (function() {
+                        // Single global handler — survives multiple
+                        // email-inbox sections on the same page.
+                        if ( window.__cmmsEmailInboxBound ) return;
+                        window.__cmmsEmailInboxBound = true;
+
+                        document.addEventListener('click', function(e) {
+                            // ── Copy address button ──
+                            var copyBtn = e.target.closest('.cmms-email-inbox-copy-btn');
+                            if ( copyBtn ) {
+                                e.preventDefault();
+                                var addr = copyBtn.getAttribute('data-address') || '';
+                                var label = copyBtn.querySelector('.cmms-email-inbox-copy-label');
+                                var original = label ? label.innerHTML : '';
+                                var done = function() {
+                                    if ( label ) {
+                                        label.innerHTML = '✓ הועתק!';
+                                        setTimeout(function() { label.innerHTML = original; }, 2000);
+                                    }
+                                };
+                                if ( navigator.clipboard && navigator.clipboard.writeText ) {
+                                    navigator.clipboard.writeText( addr ).then( done ).catch(function() {
+                                        fallbackCopy( addr, done );
+                                    });
+                                } else {
+                                    fallbackCopy( addr, done );
+                                }
+                                return;
+                            }
+
+                            // ── Test button ──
+                            var testBtn = e.target.closest('.cmms-email-inbox-test-btn');
+                            if ( ! testBtn ) return;
+                            e.preventDefault();
+
+                            var panel = testBtn.closest('.cmms-field');
+                            var resultDiv = panel.querySelector('.cmms-email-inbox-test-result');
+                            var url = testBtn.getAttribute('data-endpoint-url');
+
+                            var originalText = testBtn.textContent;
+                            testBtn.disabled = true;
+                            testBtn.textContent = '...';
+                            showResult(resultDiv, 'info', '⏳ שולח מייל-בדיקה...');
+
+                            // Simulate a real incoming email. _test:true means
+                            // the endpoint will preview but not create a task.
+                            fetch(url, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    _test: true,
+                                    from: 'test@example.com',
+                                    from_name: 'בדיקה',
+                                    subject: 'מייל בדיקה - לא משימה אמיתית',
+                                    text: 'זוהי בדיקה לוודא שהחיבור עובד. לא תיווצר משימה בפועל.'
+                                })
+                            }).then(function(response) {
+                                return response.json().then(function(body) {
+                                    return { status: response.status, body: body };
+                                }).catch(function() {
+                                    return { status: response.status, body: null };
+                                });
+                            }).then(function(result) {
+                                renderEmailTestResult(resultDiv, result);
+                            }).catch(function() {
+                                showResult(resultDiv, 'error',
+                                    '✗ <strong>שגיאת רשת</strong><br>' +
+                                    '<span style="font-size:10px;opacity:0.85;">לא ניתן להתחבר ל-endpoint.</span>'
+                                );
+                            }).finally(function() {
+                                testBtn.disabled = false;
+                                testBtn.textContent = originalText;
+                            });
+                        });
+
+                        function renderEmailTestResult(div, result) {
+                            var status = result.status;
+                            var body = result.body || {};
+
+                            if ( status === 200 && body.test_mode ) {
+                                var preview = body.would_create_task || {};
+                                var html = '✅ <strong>החיבור עובד!</strong><br>';
+                                html += '<span style="font-size:10px;opacity:0.85;">';
+                                html += 'השרת קיבל את המייל וזיהה את הטופס בהצלחה.';
+                                html += '</span>';
+                                if ( preview.form_name ) {
+                                    html += '<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(0,0,0,0.1);font-size:10px;">';
+                                    html += '<strong>טופס:</strong> ' + escapeHtml(preview.form_name);
+                                    html += '</div>';
+                                }
+                                showResult(div, 'success', html);
+                                return;
+                            }
+                            if ( status === 401 ) {
+                                showResult(div, 'error',
+                                    '✗ <strong>נדרשת חתימה</strong><br>' +
+                                    '<span style="font-size:10px;opacity:0.85;">המערכת מוגדרת לחייב חתימת HMAC, ובדיקה זו לא חתומה.</span>'
+                                );
+                                return;
+                            }
+                            if ( status === 404 ) {
+                                showResult(div, 'error',
+                                    '✗ <strong>הראוט לא רשום</strong><br>' +
+                                    '<span style="font-size:10px;opacity:0.85;">' +
+                                    'לך ל: <em>הגדרות → קישורים קבועים → שמור</em>.' +
+                                    '</span>'
+                                );
+                                return;
+                            }
+                            showResult(div, 'error',
+                                '✗ <strong>שגיאה</strong> (HTTP ' + status + ')<br>' +
+                                '<span style="font-size:10px;opacity:0.85;">' +
+                                escapeHtml(body.message || body.code || '') +
+                                '</span>'
+                            );
+                        }
+
+                        function showResult(div, kind, html) {
+                            var styles = {
+                                success: { bg: '#dcfce7', border: '#86efac', color: '#166534' },
+                                error:   { bg: '#fee2e2', border: '#fca5a5', color: '#991b1b' },
+                                warn:    { bg: '#fef3c7', border: '#fcd34d', color: '#92400e' },
+                                info:    { bg: '#dbeafe', border: '#93c5fd', color: '#1e40af' }
+                            };
+                            var s = styles[kind] || styles.info;
+                            div.style.display = 'block';
+                            div.style.background = s.bg;
+                            div.style.border = '1px solid ' + s.border;
+                            div.style.color = s.color;
+                            div.innerHTML = html;
+                        }
+
+                        function fallbackCopy(text, done) {
+                            var ta = document.createElement('textarea');
+                            ta.value = text;
+                            ta.style.position = 'fixed';
+                            ta.style.left = '-9999px';
+                            document.body.appendChild(ta);
+                            ta.select();
+                            try { document.execCommand('copy'); } catch (err) {}
+                            document.body.removeChild(ta);
+                            done();
+                        }
+
+                        function escapeHtml(s) {
+                            if ( s == null ) return '';
+                            return String(s)
+                                .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                                .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+                                .replace(/'/g, '&#039;');
+                        }
+                    })();
+                    </script>
+
+                    <?php // ── Rotate / Revoke buttons ── ?>
+                    <div style="display:flex;gap:8px;">
+                        <form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" style="flex:1;"
+                              onsubmit="return confirm('<?php echo esc_js( __( 'Generate a new email address? The current one will stop working immediately.', 'cmms-light' ) ); ?>');">
+                            <input type="hidden" name="action" value="cmms_email_inbox_rotate">
+                            <input type="hidden" name="form_id" value="<?php echo (int) $form->id; ?>">
+                            <?php wp_nonce_field( 'cmms_email_inbox_rotate', 'cmms_email_inbox_rotate_nonce' ); ?>
+                            <button type="submit" class="cmms-btn cmms-btn-sm cmms-btn-secondary" style="width:100%;">
+                                <?php CMMS_Icons::e( 'refresh-cw', 14 ); ?>
+                                <?php echo esc_html__( 'Rotate address', 'cmms-light' ); ?>
+                            </button>
+                        </form>
+                        <form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" style="flex:1;"
+                              onsubmit="return confirm('<?php echo esc_js( __( 'Revoke this email address? Forwarded emails will stop creating tasks.', 'cmms-light' ) ); ?>');">
+                            <input type="hidden" name="action" value="cmms_email_inbox_revoke">
+                            <input type="hidden" name="form_id" value="<?php echo (int) $form->id; ?>">
+                            <?php wp_nonce_field( 'cmms_email_inbox_revoke', 'cmms_email_inbox_revoke_nonce' ); ?>
+                            <button type="submit" class="cmms-btn cmms-btn-sm cmms-btn-ghost" style="width:100%;color:#b91c1c;">
+                                <?php CMMS_Icons::e( 'x-circle', 14 ); ?>
+                                <?php echo esc_html__( 'Revoke', 'cmms-light' ); ?>
+                            </button>
+                        </form>
+                    </div>
+
+                    <?php // ── Destructive-action warning ── ?>
+                    <div style="margin-top:10px;background:#fef3c7;border:1px solid #fcd34d;border-radius:6px;padding:10px 12px;font-size:11px;line-height:1.6;color:#78350f;">
+                        <div style="font-weight:600;margin-bottom:6px;">
+                            ⚠️ <?php echo esc_html__( 'Important — these actions break existing forwards', 'cmms-light' ); ?>
+                        </div>
+                        <div style="margin-bottom:5px;">
+                            <strong><?php echo esc_html__( 'Rotate address', 'cmms-light' ); ?>:</strong>
+                            <?php echo esc_html__( 'replaces the current email address with a new one. Forwarding rules pointing to the old address will silently fail. Use this when the address has leaked publicly.', 'cmms-light' ); ?>
+                        </div>
+                        <div>
+                            <strong><?php echo esc_html__( 'Revoke', 'cmms-light' ); ?>:</strong>
+                            <?php echo esc_html__( 'deletes the address entirely. Forwarded emails will no longer create tasks. Use this when ending a partnership or shutting down a specific channel.', 'cmms-light' ); ?>
+                        </div>
+                    </div>
+
+                <?php else : ?>
+                    <?php // ── No route yet — single CTA ── ?>
+                    <form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>">
+                        <input type="hidden" name="action" value="cmms_email_inbox_generate">
+                        <input type="hidden" name="form_id" value="<?php echo (int) $form->id; ?>">
+                        <?php wp_nonce_field( 'cmms_email_inbox_generate', 'cmms_email_inbox_generate_nonce' ); ?>
+                        <button type="submit" class="cmms-btn cmms-btn-primary" style="width:100%;">
+                            <?php CMMS_Icons::e( 'mail', 16 ); ?>
+                            <?php echo esc_html__( 'Create email address', 'cmms-light' ); ?>
+                        </button>
+                    </form>
+                <?php endif; ?>
+            </div>
+        </section>
         <?php
     }
 
@@ -5260,10 +11730,11 @@ body {
         if ( isset( $_GET['cmms_err'] ) ) {
             $err_code = sanitize_key( wp_unslash( $_GET['cmms_err'] ) );
             // 1.14.50: map known error codes to clear Hebrew messages.
+            // 1.14.71: user_limit message updated to suggest contacting support.
             $error_map = array(
                 'email'      => 'כתובת אימייל לא תקינה.',
                 'add'        => 'הוספת המשתמש נכשלה. ייתכן שהאימייל כבר קיים במערכת.',
-                'user_limit' => 'הגעת למגבלת המשתמשים של החבילה. כדי להוסיף עוד משתמשים — שדרג את החבילה.',
+                'user_limit' => 'הגעת למגבלת המשתמשים בחבילה. להוספת משתמשים נוספים או לשדרוג חבילה — פנו אלינו בטלפון 03-3094405.',
             );
             if ( isset( $error_map[ $err_code ] ) ) {
                 $err_msg = $error_map[ $err_code ];
@@ -5274,19 +11745,47 @@ body {
         $updated = isset( $_GET['cmms_msg'] ) && $_GET['cmms_msg'] === 'added';
         $just_added = isset( $_GET['cmms_msg'] ) && $_GET['cmms_msg'] === 'added';
 
-        // 1.14.50: compute slot usage so we can show "X/Y users" hint
-        // and disable the add form when full.
+        // 1.14.50 → 1.14.71: compute slot usage. The 1.14.71 upgrade
+        // pulls the rich snapshot from CMMS_Seats so we can show:
+        //   - included + purchased breakdown
+        //   - hard limit
+        //   - upgrade recommendation when nearing the ceiling
+        //   - "contact us" hint when at the absolute ceiling
+        //
+        // Falls back to the simple max_users count for accounts on
+        // Enterprise / unmanaged plans.
+        $seat_info = class_exists( 'CMMS_Seats' )
+            ? CMMS_Seats::get_account_seats( (int) $u->account_id )
+            : null;
+
         global $wpdb;
         $accounts_t = CMMS_DB::table( 'accounts' );
         $users_t    = CMMS_DB::table( 'users' );
-        $max_users = $wpdb->get_var( $wpdb->prepare(
-            "SELECT max_users FROM $accounts_t WHERE id = %d", (int) $u->account_id
-        ) );
-        $max_users = ( $max_users === null || $max_users === '' ) ? null : (int) $max_users;
-        $current_count = (int) $wpdb->get_var( $wpdb->prepare(
-            "SELECT COUNT(*) FROM $users_t WHERE account_id = %d AND status IN ('active','invited')",
-            (int) $u->account_id
-        ) );
+
+        if ( $seat_info && $seat_info['is_managed'] ) {
+            $max_users     = $seat_info['total_allowed'];
+            $current_count = $seat_info['currently_used'];
+            $hard_limit    = $seat_info['hard_limit'];
+            $upgrade_hint  = $seat_info['upgrade_recommended'];
+            $at_hard_cap   = $seat_info['at_hard_limit'];
+            $included      = $seat_info['included'];
+            $purchased     = $seat_info['purchased'];
+        } else {
+            // Legacy / Enterprise fallback.
+            $max_users = $wpdb->get_var( $wpdb->prepare(
+                "SELECT max_users FROM $accounts_t WHERE id = %d", (int) $u->account_id
+            ) );
+            $max_users = ( $max_users === null || $max_users === '' ) ? null : (int) $max_users;
+            $current_count = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM $users_t WHERE account_id = %d AND status IN ('active','invited')",
+                (int) $u->account_id
+            ) );
+            $hard_limit   = null;
+            $upgrade_hint = false;
+            $at_hard_cap  = false;
+            $included     = null;
+            $purchased    = 0;
+        }
         $is_full = ( $max_users !== null && $current_count >= $max_users );
         ?>
         <div class="cmms-page-head" data-cmms-page="users">
@@ -5299,6 +11798,337 @@ body {
         <?php endif; ?>
         <?php if ( $err_msg ) : ?>
             <div class="cmms-alert cmms-alert-error"><?php CMMS_Icons::e( 'alert-circle', 18 ); ?> <span><?php echo esc_html( $err_msg ); ?></span></div>
+        <?php endif; ?>
+
+        <?php // 1.14.71 — Seat status widget (read-only).
+              // 1.14.74: now includes "Add Users" button for managed plans
+              // when there's room within the hard_user_limit. Click opens
+              // the seat purchase modal.
+              //
+              // Shown for managed plans (Starter / Business). Hidden for
+              // Enterprise / legacy where the included/purchased breakdown
+              // doesn't apply.
+              if ( $seat_info && $seat_info['is_managed'] ) :
+                  $pct = ( $hard_limit && $hard_limit > 0 )
+                      ? min( 100, round( ( $current_count / $hard_limit ) * 100 ) )
+                      : 0;
+                  $bar_color = $at_hard_cap ? '#dc2626' : ( $upgrade_hint ? '#d97706' : '#10b981' );
+
+                  // 1.14.74: show "Add Users" button only when the
+                  // customer has any room left under hard_user_limit.
+                  // The role check matches plan-changes — only owners
+                  // can purchase, since billing is on the account.
+                  $can_buy_seats = (
+                      $u->role === CMMS_Auth::ROLE_OWNER
+                      && $hard_limit !== null
+                      && $seat_info['total_allowed'] < $hard_limit
+                  );
+
+                  // Seats nonce — used by the modal AJAX calls.
+                  $seats_nonce = wp_create_nonce( 'cmms_seats' );
+        ?>
+        <div class="cmms-section" style="margin-bottom:16px;">
+            <div class="cmms-section-body" style="padding:16px 18px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px;">
+                    <div style="font-size:14px;color:#475569;">
+                        <strong style="color:#0b1c33;font-size:16px;">
+                            <?php echo (int) $current_count; ?>
+                            <?php esc_html_e( 'משתמשים פעילים', 'cmms-light' ); ?>
+                        </strong>
+                        <span style="color:#64748b;">
+                            <?php echo esc_html( sprintf( __( 'מתוך %d מותרים', 'cmms-light' ), (int) $max_users ) ); ?>
+                        </span>
+                        <?php if ( $purchased > 0 ) : ?>
+                            <span style="color:#64748b;font-size:13px;">
+                                (<?php echo esc_html( sprintf( __( '%1$d כלולים + %2$d נוספים', 'cmms-light' ), (int) $included, (int) $purchased ) ); ?>)
+                            </span>
+                        <?php endif; ?>
+                    </div>
+                    <?php if ( $hard_limit !== null ) : ?>
+                    <div style="font-size:12px;color:#94a3b8;">
+                        <?php echo esc_html( sprintf( __( 'גג חבילה: עד %d משתמשים', 'cmms-light' ), (int) $hard_limit ) ); ?>
+                    </div>
+                    <?php endif; ?>
+                </div>
+                <div style="height:6px;background:#e2e8f0;border-radius:999px;overflow:hidden;">
+                    <div style="height:100%;width:<?php echo (int) $pct; ?>%;background:<?php echo esc_attr( $bar_color ); ?>;transition:width .3s ease;"></div>
+                </div>
+
+                <?php if ( $at_hard_cap || $is_full ) : ?>
+                    <div style="margin-top:12px;padding:10px 14px;background:#fef2f2;border:1px solid #fecaca;border-radius:8px;font-size:13.5px;color:#7f1d1d;">
+                        <strong><?php esc_html_e( 'הגעת לגג המשתמשים בחבילה.', 'cmms-light' ); ?></strong>
+                        <?php esc_html_e( 'להוספת משתמשים נוספים פנו אלינו:', 'cmms-light' ); ?>
+                        <a href="tel:+97233094405" style="color:#7f1d1d;font-weight:700;text-decoration:underline;">03-3094405</a>
+                    </div>
+                <?php elseif ( $upgrade_hint ) : ?>
+                    <div style="margin-top:12px;padding:10px 14px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;font-size:13.5px;color:#78350f;">
+                        <strong><?php esc_html_e( 'מתקרבים לגג החבילה.', 'cmms-light' ); ?></strong>
+                        <?php esc_html_e( 'מומלץ לשדרג לחבילה גדולה יותר. לפרטים פנו אלינו:', 'cmms-light' ); ?>
+                        <a href="tel:+97233094405" style="color:#78350f;font-weight:700;text-decoration:underline;">03-3094405</a>
+                    </div>
+                <?php endif; ?>
+
+                <?php if ( $can_buy_seats ) : ?>
+                <div style="margin-top:14px;display:flex;justify-content:flex-end;align-items:center;gap:12px;flex-wrap:wrap;">
+                    <span style="font-size:12px;color:#64748b;">
+                        <?php esc_html_e( 'צריך יותר מקומות?', 'cmms-light' ); ?>
+                    </span>
+                    <button type="button"
+                            data-seats-open
+                            style="background:#fff;color:#ea580c;border:1.5px solid #ea580c;padding:7px 14px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px;transition:background .15s ease,color .15s ease;"
+                            onmouseover="this.style.background='#fff7ed'"
+                            onmouseout="this.style.background='#fff'">
+                        <span style="font-size:14px;">💳</span>
+                        <span><?php esc_html_e( 'רכוש משתמשים נוספים לחבילה', 'cmms-light' ); ?></span>
+                    </button>
+                </div>
+                <?php endif; ?>
+            </div>
+        </div>
+        <?php endif; ?>
+
+        <?php // ─────────────────────────────────────────────────────────
+              // 1.14.74 — Seat Purchase Modal
+              //
+              // Rendered only when the plan is managed AND the user is
+              // the account owner AND there's room left under hard_user_limit.
+              // Triggered by [data-seats-open] buttons elsewhere on the page.
+              // ─────────────────────────────────────────────────────────
+              if ( isset( $can_buy_seats ) && $can_buy_seats ) :
+                  $modal_room_left = $hard_limit - $seat_info['total_allowed'];
+                  $seats_nonce_for_modal = wp_create_nonce( 'cmms_seats' );
+        ?>
+        <div class="cmms-seats-modal" id="cmms-seats-modal" hidden aria-hidden="true" role="dialog" aria-labelledby="cmms-seats-modal-title">
+            <div class="cmms-seats-modal-backdrop" data-seats-close></div>
+            <div class="cmms-seats-modal-panel">
+                <header class="cmms-seats-modal-head">
+                    <h2 id="cmms-seats-modal-title">רכישת משתמשים נוספים לחבילה</h2>
+                    <button type="button" class="cmms-seats-modal-close" data-seats-close aria-label="סגור">×</button>
+                </header>
+                <div class="cmms-seats-modal-body">
+                    <div class="cmms-seats-modal-status">
+                        <div>
+                            <div class="cmms-seats-modal-status-label">משתמשים פעילים כעת</div>
+                            <div class="cmms-seats-modal-status-value"><?php echo (int) $current_count; ?> / <?php echo (int) $max_users; ?></div>
+                        </div>
+                        <div>
+                            <div class="cmms-seats-modal-status-label">גג החבילה</div>
+                            <div class="cmms-seats-modal-status-value"><?php echo (int) $hard_limit; ?> משתמשים</div>
+                        </div>
+                    </div>
+                    <div class="cmms-seats-modal-picker">
+                        <label class="cmms-seats-modal-picker-label">כמה משתמשים נוספים?</label>
+                        <div class="cmms-seats-modal-picker-control">
+                            <button type="button" class="cmms-seats-modal-picker-btn" data-seats-action="dec" aria-label="פחות">−</button>
+                            <input type="number" class="cmms-seats-modal-picker-input" id="cmms-seats-count" value="1" min="1" max="<?php echo (int) $modal_room_left; ?>" inputmode="numeric">
+                            <button type="button" class="cmms-seats-modal-picker-btn" data-seats-action="inc" aria-label="עוד">+</button>
+                        </div>
+                        <div class="cmms-seats-modal-picker-hint">ניתן להוסיף עד <?php echo (int) $modal_room_left; ?> משתמשים בחבילה הנוכחית</div>
+                    </div>
+                    <div class="cmms-seats-modal-quote" data-seats-quote>
+                        <div class="cmms-seats-modal-quote-loading" data-seats-loading>טוען חישוב…</div>
+                        <div class="cmms-seats-modal-quote-content" data-seats-content hidden>
+                            <div class="cmms-seats-modal-quote-line"><span>תוספת חודשית</span><strong data-seats-monthly>—</strong></div>
+                            <div class="cmms-seats-modal-quote-line"><span>עלות יחסית לתקופה שנותרה</span><strong data-seats-prorated-detail>—</strong></div>
+                            <div class="cmms-seats-modal-quote-line cmms-seats-modal-quote-line-emphasis"><span>💳 לתשלום היום</span><strong data-seats-pay-today>—</strong></div>
+                            <div class="cmms-seats-modal-quote-line"><span>🔁 מהחודש הבא</span><strong data-seats-next-cycle>—</strong></div>
+                            <p class="cmms-seats-modal-quote-note" data-seats-explain></p>
+                        </div>
+                        <div class="cmms-seats-modal-quote-error" data-seats-error hidden></div>
+                    </div>
+                </div>
+                <footer class="cmms-seats-modal-foot">
+                    <button type="button" class="cmms-seats-modal-cancel" data-seats-close>ביטול</button>
+                    <button type="button" class="cmms-seats-modal-pay" data-seats-pay disabled>
+                        <span class="cmms-seats-modal-pay-label">המשך לתשלום מאובטח</span>
+                        <span class="cmms-seats-modal-pay-spinner" hidden></span>
+                    </button>
+                </footer>
+                <p class="cmms-seats-modal-trust">🔒 תשלום מאובטח דרך iCredit · פרטי האשראי לא נשמרים אצלנו</p>
+            </div>
+        </div>
+
+        <div class="cmms-seats-toast" id="cmms-seats-toast" hidden role="status" aria-live="polite">
+            <span class="cmms-seats-toast-icon">🎉</span>
+            <span class="cmms-seats-toast-text" data-toast-text>הוספת המשתמשים הצליחה!</span>
+            <button type="button" class="cmms-seats-toast-close" data-toast-close aria-label="סגור">×</button>
+        </div>
+
+        <style>
+            .cmms-seats-modal { position: fixed; inset: 0; z-index: 9999; display: flex; align-items: flex-end; justify-content: center; font-family: Arial, sans-serif; }
+            .cmms-seats-modal[hidden] { display: none; }
+            .cmms-seats-modal-backdrop { position: absolute; inset: 0; background: rgba(15,23,42,0.5); animation: cmms-seats-fade-in .2s ease; }
+            .cmms-seats-modal-panel { position: relative; background: #fff; width: 100%; max-width: 480px; max-height: 92vh; overflow-y: auto; border-radius: 18px 18px 0 0; animation: cmms-seats-slide-up .25s ease; display: flex; flex-direction: column; }
+            @media (min-width: 640px) { .cmms-seats-modal { align-items: center; } .cmms-seats-modal-panel { border-radius: 18px; animation: cmms-seats-pop .2s ease; } }
+            @keyframes cmms-seats-fade-in { from { opacity: 0 } to { opacity: 1 } }
+            @keyframes cmms-seats-slide-up { from { transform: translateY(100%) } to { transform: translateY(0) } }
+            @keyframes cmms-seats-pop { from { opacity: 0; transform: scale(.96) } to { opacity: 1; transform: scale(1) } }
+            .cmms-seats-modal-head { display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; border-bottom: 1px solid #e2e8f0; position: sticky; top: 0; background: #fff; z-index: 1; }
+            .cmms-seats-modal-head h2 { margin: 0; font-size: 18px; font-weight: 700; color: #0f172a; }
+            .cmms-seats-modal-close { background: transparent; border: 0; font-size: 28px; line-height: 1; color: #64748b; cursor: pointer; padding: 4px 10px; border-radius: 6px; }
+            .cmms-seats-modal-close:hover { background: #f1f5f9; color: #0f172a; }
+            .cmms-seats-modal-body { padding: 20px; display: flex; flex-direction: column; gap: 20px; }
+            .cmms-seats-modal-status { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px 14px; }
+            .cmms-seats-modal-status-label { font-size: 12px; color: #64748b; font-weight: 500; margin-bottom: 4px; }
+            .cmms-seats-modal-status-value { font-size: 16px; font-weight: 700; color: #0f172a; }
+            .cmms-seats-modal-picker-label { display: block; font-size: 14px; font-weight: 600; color: #0f172a; margin-bottom: 8px; }
+            .cmms-seats-modal-picker-control { display: flex; align-items: stretch; border: 1.5px solid #cbd5e1; border-radius: 10px; overflow: hidden; height: 52px; }
+            .cmms-seats-modal-picker-btn { flex: none; width: 56px; background: #fff; border: 0; color: #475569; font-size: 24px; font-weight: 600; cursor: pointer; line-height: 1; }
+            .cmms-seats-modal-picker-btn:hover:not(:disabled) { background: #f1f5f9; color: #0f172a; }
+            .cmms-seats-modal-picker-btn:disabled { opacity: .35; cursor: not-allowed; }
+            .cmms-seats-modal-picker-input { flex: 1; border: 0; border-inline: 1.5px solid #e2e8f0; text-align: center; font-size: 20px; font-weight: 700; color: #0f172a; background: #fff; -moz-appearance: textfield; appearance: textfield; }
+            .cmms-seats-modal-picker-input::-webkit-outer-spin-button, .cmms-seats-modal-picker-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+            .cmms-seats-modal-picker-input:focus { outline: 0; background: #fffbf5; }
+            .cmms-seats-modal-picker-hint { margin-top: 8px; font-size: 12px; color: #64748b; }
+            .cmms-seats-modal-quote { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px 16px; min-height: 80px; position: relative; }
+            .cmms-seats-modal-quote-loading { text-align: center; color: #64748b; font-size: 13px; padding: 8px 0; }
+            .cmms-seats-modal-quote-line { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; font-size: 14px; color: #475569; }
+            .cmms-seats-modal-quote-line + .cmms-seats-modal-quote-line { border-top: 1px dashed #e2e8f0; }
+            .cmms-seats-modal-quote-line strong { color: #0f172a; font-weight: 600; }
+            .cmms-seats-modal-quote-line-emphasis { font-size: 15px; margin-top: 4px; padding-top: 12px !important; border-top: 2px solid #cbd5e1 !important; }
+            .cmms-seats-modal-quote-line-emphasis strong { font-size: 18px; color: #4f46e5; }
+            .cmms-seats-modal-quote-note { margin: 12px 0 0; font-size: 12px; color: #64748b; line-height: 1.5; }
+            .cmms-seats-modal-quote-error { color: #b91c1c; background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 10px 12px; font-size: 13.5px; }
+            .cmms-seats-modal-foot { display: flex; gap: 10px; padding: 16px 20px; border-top: 1px solid #e2e8f0; background: #fff; }
+            .cmms-seats-modal-cancel { flex: 0 0 auto; background: #fff; color: #475569; border: 1.5px solid #cbd5e1; border-radius: 10px; padding: 0 18px; height: 48px; font-size: 14px; font-weight: 600; cursor: pointer; }
+            .cmms-seats-modal-cancel:hover { background: #f8fafc; color: #0f172a; }
+            .cmms-seats-modal-pay { flex: 1; background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%); color: #fff; border: 0; border-radius: 10px; padding: 0 18px; height: 48px; font-size: 14px; font-weight: 600; cursor: pointer; box-shadow: 0 4px 14px rgba(79,70,229,.32); display: inline-flex; align-items: center; justify-content: center; gap: 8px; }
+            .cmms-seats-modal-pay:hover:not(:disabled) { box-shadow: 0 6px 18px rgba(79,70,229,.4); }
+            .cmms-seats-modal-pay:disabled { opacity: .5; cursor: not-allowed; box-shadow: none; }
+            .cmms-seats-modal-pay-spinner { width: 16px; height: 16px; border: 2px solid rgba(255,255,255,.4); border-top-color: #fff; border-radius: 50%; animation: cmms-seats-spin .7s linear infinite; }
+            .cmms-seats-modal-pay-spinner[hidden] { display: none; }
+            @keyframes cmms-seats-spin { to { transform: rotate(360deg); } }
+            .cmms-seats-modal-trust { text-align: center; padding: 0 20px 16px; margin: 0; font-size: 11.5px; color: #94a3b8; }
+            .cmms-seats-toast { position: fixed; top: 18px; left: 50%; transform: translateX(-50%); z-index: 9998; background: #ecfdf5; color: #065f46; border: 1px solid #6ee7b7; border-radius: 12px; padding: 12px 18px; box-shadow: 0 8px 24px rgba(16,185,129,.18); display: flex; align-items: center; gap: 12px; font-family: Arial, sans-serif; font-size: 14px; font-weight: 500; max-width: 90vw; animation: cmms-seats-toast-in .3s ease; }
+            .cmms-seats-toast[hidden] { display: none; }
+            .cmms-seats-toast-icon { font-size: 20px; line-height: 1; }
+            .cmms-seats-toast-text { flex: 1; }
+            .cmms-seats-toast-close { background: transparent; border: 0; color: #047857; font-size: 22px; line-height: 1; cursor: pointer; padding: 0 4px; }
+            @keyframes cmms-seats-toast-in { from { opacity: 0; transform: translate(-50%, -10px); } to { opacity: 1; transform: translate(-50%, 0); } }
+        </style>
+
+        <script>
+        (function () {
+            'use strict';
+            var modal = document.getElementById('cmms-seats-modal');
+            if (!modal) return;
+            var openButtons = document.querySelectorAll('[data-seats-open]');
+            var closeButtons = modal.querySelectorAll('[data-seats-close]');
+            var input = document.getElementById('cmms-seats-count');
+            var decBtn = modal.querySelector('[data-seats-action="dec"]');
+            var incBtn = modal.querySelector('[data-seats-action="inc"]');
+            var payBtn = modal.querySelector('[data-seats-pay]');
+            var paySpinner = modal.querySelector('.cmms-seats-modal-pay-spinner');
+            var paylabel = modal.querySelector('.cmms-seats-modal-pay-label');
+            var loadingEl = modal.querySelector('[data-seats-loading]');
+            var contentEl = modal.querySelector('[data-seats-content]');
+            var errorEl = modal.querySelector('[data-seats-error]');
+            var monthlyEl = modal.querySelector('[data-seats-monthly]');
+            var proratedDetailEl = modal.querySelector('[data-seats-prorated-detail]');
+            var payTodayEl = modal.querySelector('[data-seats-pay-today]');
+            var nextCycleEl = modal.querySelector('[data-seats-next-cycle]');
+            var explainEl = modal.querySelector('[data-seats-explain]');
+            var nonce = <?php echo wp_json_encode( $seats_nonce_for_modal ); ?>;
+            var ajaxUrl = <?php echo wp_json_encode( admin_url( 'admin-ajax.php' ) ); ?>;
+            var maxAllowed = parseInt(input.getAttribute('max'), 10) || 1;
+            var lastQuoteAbort = null;
+            var quoteDebounce = null;
+            function fmtPrice(n) { try { return '₪' + Math.round(n).toLocaleString('he-IL'); } catch (e) { return '₪' + Math.round(n); } }
+            function clampInput() {
+                var v = parseInt(input.value, 10);
+                if (isNaN(v) || v < 1) v = 1;
+                if (v > maxAllowed) v = maxAllowed;
+                if (String(v) !== input.value) input.value = v;
+                decBtn.disabled = (v <= 1);
+                incBtn.disabled = (v >= maxAllowed);
+                return v;
+            }
+            function setLoading() { loadingEl.hidden = false; contentEl.hidden = true; errorEl.hidden = true; payBtn.disabled = true; }
+            function showError(msg) { loadingEl.hidden = true; contentEl.hidden = true; errorEl.hidden = false; errorEl.textContent = msg || 'אירעה שגיאה. נסה שוב.'; payBtn.disabled = true; }
+            function showQuote(data) {
+                loadingEl.hidden = true; errorEl.hidden = true; contentEl.hidden = false; payBtn.disabled = false;
+                var count = data.count; var seatPrice = data.seat_price; var monthlyAdd = count * seatPrice;
+                monthlyEl.textContent = count + ' משתמשים × ' + fmtPrice(seatPrice) + ' = ' + fmtPrice(monthlyAdd);
+                proratedDetailEl.textContent = fmtPrice(monthlyAdd) + ' × ' + data.days_remaining + ' / ' + data.days_in_cycle;
+                payTodayEl.textContent = fmtPrice(data.prorated_amount);
+                nextCycleEl.textContent = fmtPrice(data.new_recurring) + ' / חודש';
+                explainEl.innerHTML = 'ℹ העלות היחסית מבוססת על <strong>' + data.days_remaining + '</strong> הימים שנותרו עד החיוב הבא.';
+            }
+            function fetchQuote() {
+                var count = clampInput();
+                setLoading();
+                if (lastQuoteAbort) { try { lastQuoteAbort.abort(); } catch (e) {} }
+                var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+                lastQuoteAbort = ctrl;
+                var body = new URLSearchParams();
+                body.set('action', 'cmms_seats_quote');
+                body.set('nonce', nonce);
+                body.set('count', String(count));
+                fetch(ajaxUrl, {
+                    method: 'POST', credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: body.toString(), signal: ctrl ? ctrl.signal : undefined
+                })
+                .then(function (r) { return r.json(); })
+                .then(function (res) {
+                    if (res && res.success && res.data) { showQuote(res.data); }
+                    else { showError(res && res.data && res.data.message ? res.data.message : 'אירעה שגיאה.'); }
+                })
+                .catch(function (err) { if (err && err.name === 'AbortError') return; showError('שגיאת רשת. בדוק את החיבור ונסה שוב.'); });
+            }
+            function debouncedFetch() { if (quoteDebounce) clearTimeout(quoteDebounce); quoteDebounce = setTimeout(fetchQuote, 200); }
+            function openModal() { modal.hidden = false; modal.setAttribute('aria-hidden', 'false'); document.body.style.overflow = 'hidden'; input.value = '1'; clampInput(); fetchQuote(); }
+            function closeModal() { modal.hidden = true; modal.setAttribute('aria-hidden', 'true'); document.body.style.overflow = ''; }
+            openButtons.forEach(function (b) { b.addEventListener('click', openModal); });
+            closeButtons.forEach(function (b) { b.addEventListener('click', closeModal); });
+            document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !modal.hidden) closeModal(); });
+            decBtn.addEventListener('click', function () { input.value = parseInt(input.value, 10) - 1; clampInput(); debouncedFetch(); });
+            incBtn.addEventListener('click', function () { input.value = parseInt(input.value, 10) + 1; clampInput(); debouncedFetch(); });
+            input.addEventListener('input', function () { clampInput(); debouncedFetch(); });
+            payBtn.addEventListener('click', function () {
+                if (payBtn.disabled) return;
+                var count = clampInput();
+                payBtn.disabled = true; paySpinner.hidden = false; paylabel.textContent = 'מעביר לתשלום...';
+                var body = new URLSearchParams();
+                body.set('action', 'cmms_seats_purchase');
+                body.set('nonce', nonce);
+                body.set('count', String(count));
+                fetch(ajaxUrl, {
+                    method: 'POST', credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: body.toString()
+                })
+                .then(function (r) { return r.json(); })
+                .then(function (res) {
+                    if (res && res.success && res.data && res.data.redirect) {
+                        try { sessionStorage.setItem('cmms_seats_pending', String(count)); } catch (e) {}
+                        window.location.href = res.data.redirect; return;
+                    }
+                    var err = res && res.data || {};
+                    if (err.redirect) { window.location.href = err.redirect; return; }
+                    showError(err.message || 'לא הצלחנו להעביר לתשלום. נסה שוב.');
+                    payBtn.disabled = false; paySpinner.hidden = true; paylabel.textContent = 'המשך לתשלום מאובטח';
+                })
+                .catch(function () { showError('שגיאת רשת. בדוק את החיבור ונסה שוב.'); payBtn.disabled = false; paySpinner.hidden = true; paylabel.textContent = 'המשך לתשלום מאובטח'; });
+            });
+            var toast = document.getElementById('cmms-seats-toast');
+            if (toast) {
+                var toastText = toast.querySelector('[data-toast-text]');
+                var closeBtnT = toast.querySelector('[data-toast-close]');
+                function showToast(seatsCount) {
+                    toastText.textContent = seatsCount + ' משתמשים נוספים נפתחו בחשבונך 🎉';
+                    toast.hidden = false;
+                    setTimeout(function () { toast.hidden = true; }, 6000);
+                }
+                if (closeBtnT) closeBtnT.addEventListener('click', function () { toast.hidden = true; });
+                try {
+                    var pendingCount = sessionStorage.getItem('cmms_seats_pending');
+                    var urlSeatsAdded = (new URLSearchParams(window.location.search)).get('seats_added');
+                    if (urlSeatsAdded) { showToast(parseInt(urlSeatsAdded, 10) || pendingCount || 0); sessionStorage.removeItem('cmms_seats_pending'); }
+                } catch (e) {}
+            }
+        })();
+        </script>
         <?php endif; ?>
 
         <div class="cmms-section">
@@ -5320,7 +12150,7 @@ body {
                 <?php if ( $is_full ) : ?>
                     <div class="cmms-alert cmms-alert-warning" style="margin-bottom:16px;">
                         <?php CMMS_Icons::e( 'alert-circle', 18 ); ?>
-                        <span>הגעת למגבלת המשתמשים של החבילה (<?php echo (int) $max_users; ?>). כדי להוסיף עוד משתמשים — שדרג את החבילה.</span>
+                        <span>הגעת למגבלת המשתמשים בחבילה (<?php echo (int) $max_users; ?>). להוספת משתמשים נוספים פנו אלינו בטלפון <strong dir="ltr">03-3094405</strong>.</span>
                     </div>
                 <?php endif; ?>
                 <form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" class="cmms-form"<?php echo $is_full ? ' style="opacity:0.5; pointer-events:none;"' : ''; ?>>
@@ -5598,6 +12428,46 @@ body {
             $assignable[] = $user_row;
         }
 
+        // 1.14.90: Pre-load this account's forms so the manager can extend
+        // the bulk grid with form-specific columns (e.g. "External ticket #",
+        // "Customer reference"). The form's fields are surfaced as extra
+        // columns; values flow into the task's external_data — the same
+        // place public form submissions store their answers, so existing
+        // task views render them identically.
+        $forms_raw = CMMS_Forms::list_by_account( (int) $u->account_id );
+        $forms_for_js = array();
+        foreach ( (array) $forms_raw as $f ) {
+            if ( empty( $f->enabled ) ) continue;
+            $fields = CMMS_Forms::get_fields( (int) $f->id );
+            $fields_payload = array();
+            foreach ( (array) $fields as $fld ) {
+                // File fields cannot be filled from a bulk grid — there is
+                // no per-cell upload UX and supporting one here would blow
+                // up the paste-from-Excel flow. We still surface them as
+                // a (disabled) column so the manager understands the
+                // form's full shape; they can always be filled later from
+                // the task view.
+                $opts = array();
+                if ( ! empty( $fld->options ) ) {
+                    foreach ( explode( ',', (string) $fld->options ) as $opt ) {
+                        $opt = trim( $opt );
+                        if ( $opt !== '' ) $opts[] = $opt;
+                    }
+                }
+                $fields_payload[] = array(
+                    'id'         => (int) $fld->id,
+                    'label'      => (string) $fld->label,
+                    'field_type' => (string) $fld->field_type,
+                    'options'    => $opts,
+                );
+            }
+            $forms_for_js[] = array(
+                'id'     => (int) $f->id,
+                'name'   => (string) $f->name,
+                'fields' => $fields_payload,
+            );
+        }
+
         $nonce = wp_create_nonce( 'cmms_bulk_tasks' );
         $endpoint = admin_url( 'admin-post.php?action=cmms_bulk_tasks_save' );
 
@@ -5608,6 +12478,7 @@ body {
             'home'      => home_url( '/cmms-dashboard/?view=tasks' ),
             'assets'    => array_map( function( $a ) { return array( 'id' => (int) $a->id, 'name' => $a->name ); }, (array) $assets ),
             'users'     => array_map( function( $u ) { return array( 'id' => (int) $u->id, 'name' => $u->display_name ?: $u->user_login ); }, (array) $assignable ),
+            'forms'     => $forms_for_js, // 1.14.90
             'priorities'=> array(
                 array( 'value' => 'low',    'label' => $this->t( 'priority.low' )    ?: 'Low' ),
                 array( 'value' => 'normal', 'label' => $this->t( 'priority.normal' ) ?: 'Normal' ),
@@ -5634,6 +12505,13 @@ body {
                 'go_to_import'     => $this->t( 'bulk.go_to_import' ),
                 'paste_hint'       => $this->t( 'bulk.paste_hint' ),
                 'view_tasks'       => $this->t( 'bulk.view_tasks' ),
+                // 1.14.90: form-extension UI
+                'form_label'       => $this->t( 'bulk.form_label' ),
+                'form_none'        => $this->t( 'bulk.form_none' ),
+                'form_hint'        => $this->t( 'bulk.form_hint' ),
+                'file_unsupported' => $this->t( 'bulk.file_unsupported' ),
+                'select_value'     => $this->t( 'bulk.select_value' ),
+                'form_empty'       => $this->t( 'bulk.form_empty' ),
             ),
         );
         ?>
@@ -5654,12 +12532,28 @@ body {
         <div class="cmms-section">
             <div class="cmms-bulk-toolbar">
                 <p class="cmms-bulk-hint"><?php $this->e( 'bulk.paste_hint' ); ?></p>
+                <?php if ( ! empty( $forms_for_js ) ) : ?>
+                    <div class="cmms-bulk-form-picker" data-cmms-bulk-form-picker>
+                        <label for="cmms-bulk-form-select" class="cmms-bulk-form-picker-label">
+                            <?php $this->e( 'bulk.form_label' ); ?>
+                        </label>
+                        <select id="cmms-bulk-form-select" data-cmms-bulk-form-select class="cmms-bulk-form-select">
+                            <option value=""><?php $this->e( 'bulk.form_none' ); ?></option>
+                            <?php foreach ( $forms_for_js as $f_opt ) : ?>
+                                <option value="<?php echo (int) $f_opt['id']; ?>">
+                                    <?php echo esc_html( $f_opt['name'] ); ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                        <span class="cmms-bulk-form-hint"><?php $this->e( 'bulk.form_hint' ); ?></span>
+                    </div>
+                <?php endif; ?>
             </div>
 
             <div class="cmms-bulk-grid-wrap" data-cmms-bulk-root>
                 <table class="cmms-bulk-grid" data-cmms-bulk-grid>
                     <thead>
-                        <tr>
+                        <tr data-cmms-bulk-head>
                             <th class="cmms-bulk-th-num">#</th>
                             <th><?php $this->e( 'bulk.col_title' ); ?> <span class="cmms-required">*</span></th>
                             <th><?php $this->e( 'bulk.col_description' ); ?></th>
@@ -5667,6 +12561,7 @@ body {
                             <th><?php $this->e( 'bulk.col_priority' ); ?></th>
                             <th><?php $this->e( 'bulk.col_assignee' ); ?></th>
                             <th><?php $this->e( 'bulk.col_due' ); ?></th>
+                            <?php /* 1.14.90: extra <th>s are appended here by JS when a form is selected */ ?>
                         </tr>
                     </thead>
                     <tbody data-cmms-bulk-body></tbody>
@@ -5762,6 +12657,9 @@ body {
         $tab = isset( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : 'org';
         $valid_tabs = array( 'org', 'categories', 'asset_fields', 'notify' );
         if ( $is_owner ) $valid_tabs[] = 'billing';
+        // 1.14.84: Telegram tab. Available to every user — each user
+        // links their own Telegram account from here.
+        if ( CMMS_Telegram::is_enabled() ) $valid_tabs[] = 'telegram';
         if ( ! in_array( $tab, $valid_tabs, true ) ) $tab = 'org';
 
         $saved = isset( $_GET['cmms_msg'] ) && $_GET['cmms_msg'] === 'saved';
@@ -5842,6 +12740,12 @@ body {
                 חברות וחיוב
             </a>
             <?php endif; ?>
+            <?php if ( CMMS_Telegram::is_enabled() ) : ?>
+            <a href="<?php echo esc_url( $this->url( array( 'view' => 'settings', 'tab' => 'telegram' ) ) ); ?>"
+               class="cmms-settings-tab <?php echo $tab === 'telegram' ? 'active' : ''; ?>">
+                📱 טלגרם
+            </a>
+            <?php endif; ?>
         </div>
 
         <?php if ( $saved ) : ?>
@@ -5871,31 +12775,500 @@ body {
             </div>
         </section>
 
-        <?php elseif ( $tab === 'categories' ) : ?>
+        <?php
+        // 1.14.87: Task lifecycle settings. Only owners and managers
+        // can change these — but it's part of the org tab because
+        // they're operational settings, not personal preferences.
+        if ( in_array( $u->role, array( CMMS_Auth::ROLE_OWNER, CMMS_Auth::ROLE_MANAGER ), true ) ) :
+            $task_settings = CMMS_Task_Settings::get( (int) $u->account_id );
+            $gps_saved = ! empty( $_GET['task_settings_saved'] );
+        ?>
         <section class="cmms-section">
-            <div class="cmms-section-head"><h3 class="cmms-section-title"><?php CMMS_Icons::e( 'tag', 16 ); ?> <?php $this->e( 'settings.categories' ); ?></h3></div>
+            <div class="cmms-section-head">
+                <h3 class="cmms-section-title">📍 הגדרות משימות</h3>
+            </div>
             <div class="cmms-section-body">
+                <?php if ( $gps_saved ) : ?>
+                    <div class="cmms-alert cmms-alert-success" style="margin-bottom:14px;">
+                        ✅ ההגדרות נשמרו בהצלחה
+                    </div>
+                <?php endif; ?>
                 <form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" class="cmms-form">
-                    <input type="hidden" name="action" value="cmms_categories_update">
-                    <?php wp_nonce_field( 'cmms_categories_update', 'cmms_categories_update_nonce' ); ?>
-                    <?php foreach ( $cats as $c ) : ?>
-                        <input type="hidden" name="cat_ids[]" value="<?php echo (int) $c->id; ?>">
-                        <label class="cmms-checkbox">
-                            <input type="checkbox" name="enabled[]" value="<?php echo (int) $c->id; ?>" <?php checked( $c->enabled ); ?>>
-                            <?php echo esc_html( $c->name ); ?>
+                    <input type="hidden" name="action" value="cmms_task_settings_update">
+                    <?php wp_nonce_field( 'cmms_task_settings_update', 'cmms_task_settings_update_nonce' ); ?>
+
+                    <div class="cmms-field" style="display:flex;gap:12px;align-items:flex-start;padding:14px;background:#f8fafc;border-radius:8px;border:1px solid #e2e8f0;">
+                        <input type="checkbox"
+                               id="require_location_on_complete"
+                               name="require_location_on_complete"
+                               value="1"
+                               <?php checked( ! empty( $task_settings['require_location_on_complete'] ) ); ?>
+                               style="margin-top:3px;width:18px;height:18px;cursor:pointer;">
+                        <label for="require_location_on_complete" style="cursor:pointer;flex:1;">
+                            <div style="font-weight:600;font-size:14px;color:#0f172a;margin-bottom:4px;">
+                                בקש מיקום (GPS) בסגירת משימה
+                            </div>
+                            <div style="font-size:12.5px;color:#64748b;line-height:1.5;">
+                                כשמשתמש מסמן משימה כ"הושלם ונסגר", המערכת תבקש את המיקום שלו מהדפדפן/הטלפון.
+                                המיקום ישמר עם המשימה כהוכחה שהטכנאי באמת הגיע לאתר. אם המשתמש מסרב לשתף מיקום -
+                                המשימה עדיין תיסגר, אך ללא מיקום.
+                            </div>
+                            <div style="font-size:11px;color:#94a3b8;margin-top:6px;">
+                                💡 מתאים לחברות שירות שטח, ספקים לפרויקטים, ותחזוקה במספר אתרים
+                            </div>
                         </label>
-                    <?php endforeach; ?>
-                    <div><button type="submit" class="cmms-btn cmms-btn-secondary"><?php CMMS_Icons::e( 'save', 16 ); ?> <?php $this->e( 'common.save' ); ?></button></div>
-                </form>
-                <hr style="margin:20px 0;border:none;border-top:1px solid var(--c-border);">
-                <form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" class="cmms-flex cmms-gap-2" style="align-items:flex-end;">
-                    <input type="hidden" name="action" value="cmms_category_add">
-                    <?php wp_nonce_field( 'cmms_category_add', 'cmms_category_add_nonce' ); ?>
-                    <div class="cmms-field" style="flex:1;"><label class="cmms-field-label"><?php $this->e( 'settings.add_category' ); ?></label><input class="cmms-input" name="name" type="text" required></div>
-                    <button type="submit" class="cmms-btn"><?php CMMS_Icons::e( 'plus', 16 ); ?> <?php $this->e( 'common.add' ); ?></button>
+                    </div>
+
+                    <div style="margin-top:14px;">
+                        <button type="submit" class="cmms-btn cmms-btn-primary">
+                            <?php CMMS_Icons::e( 'save', 16 ); ?> שמור הגדרות
+                        </button>
+                    </div>
                 </form>
             </div>
         </section>
+        <?php endif; ?>
+
+        <?php elseif ( $tab === 'categories' ) : ?>
+        <section class="cmms-section">
+            <div class="cmms-section-head">
+                <h3 class="cmms-section-title"><?php CMMS_Icons::e( 'tag', 16 ); ?> <?php $this->e( 'settings.categories' ); ?></h3>
+            </div>
+            <div class="cmms-section-body">
+                <?php // 1.14.82: Full self-service category management.
+                      // Customers can rename, hide, add, and delete their
+                      // own maintenance categories. All operations go
+                      // through cmms_category_* AJAX endpoints. ?>
+                <p class="cmms-muted cmms-text-sm" style="margin:0 0 18px;">
+                    <?php esc_html_e( 'התאם את קטגוריות התחזוקה לטרמינולוגיה של החברה שלך. ניתן לשנות שם, להסתיר קטגוריות שאינך משתמש בהן, ולהוסיף קטגוריות חדשות.', 'cmms-light' ); ?>
+                </p>
+
+                <div class="cmms-cat-list" data-cmms-categories>
+                    <?php foreach ( $cats as $c ) : ?>
+                        <div class="cmms-cat-row<?php echo $c->enabled ? '' : ' is-disabled'; ?>" data-cat-id="<?php echo (int) $c->id; ?>" data-is-default="<?php echo (int) $c->is_default; ?>">
+                            <div class="cmms-cat-name-wrap">
+                                <span class="cmms-cat-name" data-cmms-cat-name><?php echo esc_html( $c->name ); ?></span>
+                                <?php if ( $c->is_default ) : ?>
+                                    <span class="cmms-cat-badge"><?php esc_html_e( 'ברירת מחדל', 'cmms-light' ); ?></span>
+                                <?php endif; ?>
+                                <?php if ( ! $c->enabled ) : ?>
+                                    <span class="cmms-cat-badge cmms-cat-badge-off" data-cmms-cat-disabled-badge><?php esc_html_e( 'מוסתרת', 'cmms-light' ); ?></span>
+                                <?php endif; ?>
+                            </div>
+                            <div class="cmms-cat-actions">
+                                <button type="button" class="cmms-cat-action-btn" data-cmms-cat-edit aria-label="<?php esc_attr_e( 'שנה שם', 'cmms-light' ); ?>">
+                                    <span class="cmms-cat-action-icon">✏</span>
+                                    <span class="cmms-cat-action-label"><?php esc_html_e( 'שנה שם', 'cmms-light' ); ?></span>
+                                </button>
+                                <button type="button" class="cmms-cat-action-btn" data-cmms-cat-toggle aria-label="<?php echo $c->enabled ? esc_attr__( 'הסתר', 'cmms-light' ) : esc_attr__( 'הצג', 'cmms-light' ); ?>">
+                                    <span class="cmms-cat-action-icon"><?php echo $c->enabled ? '👁' : '🚫'; ?></span>
+                                    <span class="cmms-cat-action-label" data-cmms-toggle-label><?php echo $c->enabled ? esc_html__( 'הסתר', 'cmms-light' ) : esc_html__( 'הצג', 'cmms-light' ); ?></span>
+                                </button>
+                                <?php if ( ! $c->is_default ) : ?>
+                                    <button type="button" class="cmms-cat-action-btn cmms-cat-action-btn-danger" data-cmms-cat-delete aria-label="<?php esc_attr_e( 'מחק', 'cmms-light' ); ?>">
+                                        <span class="cmms-cat-action-icon">🗑</span>
+                                        <span class="cmms-cat-action-label"><?php esc_html_e( 'מחק', 'cmms-light' ); ?></span>
+                                    </button>
+                                <?php endif; ?>
+                            </div>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+
+                <div class="cmms-cat-add-row" style="margin-top:16px;">
+                    <input type="text" class="cmms-input" data-cmms-cat-new-name placeholder="<?php esc_attr_e( 'שם קטגוריה חדשה', 'cmms-light' ); ?>" maxlength="100" style="flex:1;">
+                    <button type="button" class="cmms-btn cmms-btn-secondary" data-cmms-cat-add>
+                        <?php CMMS_Icons::e( 'plus', 16 ); ?>
+                        <?php esc_html_e( 'הוסף קטגוריה', 'cmms-light' ); ?>
+                    </button>
+                </div>
+
+                <div class="cmms-cat-feedback" data-cmms-cat-feedback role="status" aria-live="polite" hidden></div>
+            </div>
+        </section>
+
+        <style>
+        /* 1.14.82 — Category manager UI
+           1.14.82.1 — Bigger, clearer action buttons with text labels.
+           Previous design used 32px icon-only buttons which were too
+           subtle for non-technical users to discover. Now: icon + text,
+           larger hit target, hover state. */
+        .cmms-cat-list { display: flex; flex-direction: column; gap: 10px; }
+        .cmms-cat-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            background: #fafafa;
+            border: 1px solid #e5e7eb;
+            border-radius: 10px;
+            padding: 14px 18px;
+            transition: opacity .15s ease, background .15s ease;
+        }
+        .cmms-cat-row.is-disabled { opacity: .55; }
+        .cmms-cat-row.is-editing { background: #eef2ff; border-color: #c7d2fe; }
+        .cmms-cat-name-wrap {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+            flex: 1;
+            min-width: 0;
+        }
+        .cmms-cat-name {
+            font-size: 15px;
+            font-weight: 500;
+            color: #0f172a;
+            word-break: break-word;
+        }
+        .cmms-cat-name-input {
+            font-size: 15px;
+            padding: 8px 12px;
+            border: 2px solid #6366f1;
+            border-radius: 8px;
+            font-family: inherit;
+            min-width: 220px;
+            background: white;
+        }
+        .cmms-cat-name-input:focus {
+            outline: 0;
+            box-shadow: 0 0 0 3px rgba(99,102,241,.18);
+        }
+        /* 1.14.82.1: Edit-mode hint shown above the input. */
+        .cmms-cat-edit-hint {
+            display: block;
+            margin-top: 6px;
+            font-size: 12px;
+            color: #6366f1;
+            font-weight: 500;
+        }
+        .cmms-cat-badge {
+            background: #e0e7ff;
+            color: #4338ca;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 3px 9px;
+            border-radius: 999px;
+        }
+        .cmms-cat-badge-off {
+            background: #fee2e2;
+            color: #b91c1c;
+        }
+        .cmms-cat-actions {
+            display: flex;
+            gap: 6px;
+            flex: none;
+            flex-wrap: wrap;
+        }
+        /* 1.14.82.1: Action buttons — bigger, with icon + text. */
+        .cmms-cat-action-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 12px;
+            border: 1px solid #e2e8f0;
+            background: white;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+            color: #475569;
+            font-family: inherit;
+            transition: background .12s ease, color .12s ease, border-color .12s ease;
+            min-height: 36px;
+        }
+        .cmms-cat-action-btn:hover {
+            background: #f1f5f9;
+            border-color: #cbd5e1;
+            color: #0f172a;
+        }
+        .cmms-cat-action-btn.cmms-cat-action-btn-danger:hover {
+            background: #fee2e2;
+            border-color: #fca5a5;
+            color: #b91c1c;
+        }
+        .cmms-cat-action-btn:disabled { opacity: .4; cursor: not-allowed; }
+        .cmms-cat-action-icon { font-size: 16px; line-height: 1; }
+        .cmms-cat-action-label { font-size: 13px; }
+        .cmms-cat-add-row {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+        .cmms-cat-feedback {
+            margin-top: 12px;
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-size: 13px;
+        }
+        .cmms-cat-feedback.is-success { background: #dcfce7; color: #166534; }
+        .cmms-cat-feedback.is-error   { background: #fee2e2; color: #b91c1c; }
+        @media (max-width: 640px) {
+            .cmms-cat-row {
+                padding: 12px 14px;
+                flex-direction: column;
+                align-items: stretch;
+            }
+            .cmms-cat-actions {
+                margin-top: 4px;
+                justify-content: flex-start;
+            }
+            .cmms-cat-name-input { min-width: 0; flex: 1; width: 100%; }
+            .cmms-cat-add-row { flex-direction: column; align-items: stretch; }
+            .cmms-cat-action-btn { flex: 1; justify-content: center; }
+        }
+        </style>
+
+        <script>
+        (function () {
+            'use strict';
+            var listEl = document.querySelector('[data-cmms-categories]');
+            if (!listEl) return;
+
+            var addBtn   = document.querySelector('[data-cmms-cat-add]');
+            var addInput = document.querySelector('[data-cmms-cat-new-name]');
+            var feedback = document.querySelector('[data-cmms-cat-feedback]');
+
+            var AJAX_URL = <?php echo wp_json_encode( admin_url( 'admin-ajax.php' ) ); ?>;
+            var NONCE    = <?php echo wp_json_encode( wp_create_nonce( 'cmms_categories' ) ); ?>;
+
+            function showFeedback(message, isError) {
+                if (!feedback) return;
+                feedback.textContent = message;
+                feedback.classList.toggle('is-error',   !!isError);
+                feedback.classList.toggle('is-success', !isError);
+                feedback.hidden = false;
+                clearTimeout(feedback._t);
+                feedback._t = setTimeout(function () {
+                    feedback.hidden = true;
+                }, 3500);
+            }
+
+            function postAjax(action, data) {
+                var body = new URLSearchParams();
+                body.set('action', action);
+                body.set('nonce',  NONCE);
+                Object.keys(data || {}).forEach(function (k) { body.set(k, data[k]); });
+                return fetch(AJAX_URL, {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: body.toString()
+                }).then(function (r) { return r.json().catch(function () { return null; }); });
+            }
+
+            // Edit name (inline).
+            listEl.addEventListener('click', function (e) {
+                var row = e.target.closest('.cmms-cat-row');
+                if (!row) return;
+                var catId = row.getAttribute('data-cat-id');
+
+                if (e.target.closest('[data-cmms-cat-edit]')) {
+                    enterEditMode(row);
+                } else if (e.target.closest('[data-cmms-cat-toggle]')) {
+                    toggleEnabled(row);
+                } else if (e.target.closest('[data-cmms-cat-delete]')) {
+                    deleteCategory(row);
+                }
+            });
+
+            function enterEditMode(row) {
+                if (row.classList.contains('is-editing')) return;
+                row.classList.add('is-editing');
+                var nameEl = row.querySelector('[data-cmms-cat-name]');
+                var oldName = nameEl.textContent.trim();
+                // 1.14.82.1: Wrap input + hint together so the user knows
+                // they should press Enter (no save button on purpose —
+                // inline editing pattern like Google Sheets).
+                var wrap = document.createElement('span');
+                wrap.setAttribute('data-cmms-edit-wrap', '');
+                wrap.style.display = 'inline-block';
+                var input = document.createElement('input');
+                input.type = 'text';
+                input.className = 'cmms-cat-name-input';
+                input.value = oldName;
+                input.maxLength = 100;
+                var hint = document.createElement('span');
+                hint.className = 'cmms-cat-edit-hint';
+                hint.textContent = '↵ Enter לשמירה · Esc לביטול';
+                wrap.appendChild(input);
+                wrap.appendChild(hint);
+                nameEl.replaceWith(wrap);
+                input.focus();
+                input.select();
+
+                function commit() {
+                    var newName = input.value.trim();
+                    if (!newName || newName === oldName) {
+                        cancel();
+                        return;
+                    }
+                    postAjax('cmms_category_update', {
+                        id:   row.getAttribute('data-cat-id'),
+                        name: newName
+                    }).then(function (res) {
+                        if (res && res.success) {
+                            renderName(row, res.data.name || newName);
+                            row.classList.remove('is-editing');
+                            showFeedback('הקטגוריה עודכנה');
+                        } else {
+                            var msg = (res && res.data && res.data.message) ? res.data.message : 'העדכון נכשל';
+                            showFeedback(msg, true);
+                            input.focus();
+                        }
+                    }).catch(function () {
+                        showFeedback('שגיאת רשת', true);
+                    });
+                }
+
+                function cancel() {
+                    renderName(row, oldName);
+                    row.classList.remove('is-editing');
+                }
+
+                input.addEventListener('keydown', function (ev) {
+                    if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+                    else if (ev.key === 'Escape') { ev.preventDefault(); cancel(); }
+                });
+                input.addEventListener('blur', commit);
+            }
+
+            function renderName(row, newName) {
+                var wrap = row.querySelector('[data-cmms-edit-wrap]');
+                if (!wrap) return;
+                var span = document.createElement('span');
+                span.className = 'cmms-cat-name';
+                span.setAttribute('data-cmms-cat-name', '');
+                span.textContent = newName;
+                wrap.replaceWith(span);
+            }
+
+            function toggleEnabled(row) {
+                // Toggle by checking the current "off badge" presence.
+                var isCurrentlyEnabled = !row.querySelector('[data-cmms-cat-disabled-badge]');
+                postAjax('cmms_category_toggle', {
+                    id: row.getAttribute('data-cat-id'),
+                    enabled: isCurrentlyEnabled ? 0 : 1
+                }).then(function (res) {
+                    if (res && res.success) {
+                        applyEnabledState(row, !!res.data.enabled);
+                        showFeedback(res.data.enabled ? 'הקטגוריה הוצגה' : 'הקטגוריה הוסתרה');
+                    } else {
+                        var msg = (res && res.data && res.data.message) ? res.data.message : 'הפעולה נכשלה';
+                        showFeedback(msg, true);
+                    }
+                }).catch(function () {
+                    showFeedback('שגיאת רשת', true);
+                });
+            }
+
+            function applyEnabledState(row, enabled) {
+                row.classList.toggle('is-disabled', !enabled);
+                var existingBadge = row.querySelector('[data-cmms-cat-disabled-badge]');
+                var toggleBtn = row.querySelector('[data-cmms-cat-toggle]');
+                if (enabled && existingBadge) {
+                    existingBadge.remove();
+                } else if (!enabled && !existingBadge) {
+                    var badge = document.createElement('span');
+                    badge.className = 'cmms-cat-badge cmms-cat-badge-off';
+                    badge.setAttribute('data-cmms-cat-disabled-badge', '');
+                    badge.textContent = 'מוסתרת';
+                    row.querySelector('.cmms-cat-name-wrap').appendChild(badge);
+                }
+                if (toggleBtn) {
+                    // 1.14.82.1: Update both icon AND text label so the
+                    // user sees clearly what the button now does.
+                    var icon  = toggleBtn.querySelector('.cmms-cat-action-icon');
+                    var label = toggleBtn.querySelector('[data-cmms-toggle-label]');
+                    if (icon)  icon.textContent  = enabled ? '👁' : '🚫';
+                    if (label) label.textContent = enabled ? 'הסתר' : 'הצג';
+                    toggleBtn.setAttribute('aria-label', enabled ? 'הסתר' : 'הצג');
+                }
+            }
+
+            function deleteCategory(row) {
+                if (!confirm('למחוק את הקטגוריה? פעולה זו לא ניתנת לביטול.')) return;
+                postAjax('cmms_category_delete', {
+                    id: row.getAttribute('data-cat-id')
+                }).then(function (res) {
+                    if (res && res.success) {
+                        row.style.transition = 'opacity .2s, height .2s';
+                        row.style.opacity = '0';
+                        setTimeout(function () { row.remove(); }, 200);
+                        showFeedback('הקטגוריה נמחקה');
+                    } else {
+                        var msg = (res && res.data && res.data.message) ? res.data.message : 'המחיקה נכשלה';
+                        showFeedback(msg, true);
+                    }
+                }).catch(function () {
+                    showFeedback('שגיאת רשת', true);
+                });
+            }
+
+            // Add new.
+            function doAdd() {
+                var name = (addInput.value || '').trim();
+                if (!name) {
+                    addInput.focus();
+                    return;
+                }
+                addBtn.disabled = true;
+                postAjax('cmms_category_create', { name: name }).then(function (res) {
+                    addBtn.disabled = false;
+                    if (res && res.success) {
+                        appendNewRow(res.data);
+                        addInput.value = '';
+                        addInput.focus();
+                        showFeedback('הקטגוריה נוספה');
+                    } else {
+                        var msg = (res && res.data && res.data.message) ? res.data.message : 'ההוספה נכשלה';
+                        showFeedback(msg, true);
+                    }
+                }).catch(function () {
+                    addBtn.disabled = false;
+                    showFeedback('שגיאת רשת', true);
+                });
+            }
+
+            function appendNewRow(data) {
+                var row = document.createElement('div');
+                row.className = 'cmms-cat-row';
+                row.setAttribute('data-cat-id',    String(data.id));
+                row.setAttribute('data-is-default', '0');
+                // 1.14.82.1: New rows use the same large button styling
+                // as the server-rendered ones — icon + text label.
+                row.innerHTML =
+                    '<div class="cmms-cat-name-wrap">' +
+                        '<span class="cmms-cat-name" data-cmms-cat-name></span>' +
+                    '</div>' +
+                    '<div class="cmms-cat-actions">' +
+                        '<button type="button" class="cmms-cat-action-btn" data-cmms-cat-edit aria-label="שנה שם">' +
+                            '<span class="cmms-cat-action-icon">✏</span>' +
+                            '<span class="cmms-cat-action-label">שנה שם</span>' +
+                        '</button>' +
+                        '<button type="button" class="cmms-cat-action-btn" data-cmms-cat-toggle aria-label="הסתר">' +
+                            '<span class="cmms-cat-action-icon">👁</span>' +
+                            '<span class="cmms-cat-action-label" data-cmms-toggle-label>הסתר</span>' +
+                        '</button>' +
+                        '<button type="button" class="cmms-cat-action-btn cmms-cat-action-btn-danger" data-cmms-cat-delete aria-label="מחק">' +
+                            '<span class="cmms-cat-action-icon">🗑</span>' +
+                            '<span class="cmms-cat-action-label">מחק</span>' +
+                        '</button>' +
+                    '</div>';
+                row.querySelector('[data-cmms-cat-name]').textContent = data.name;
+                listEl.appendChild(row);
+            }
+
+            if (addBtn) {
+                addBtn.addEventListener('click', doAdd);
+            }
+            if (addInput) {
+                addInput.addEventListener('keydown', function (e) {
+                    if (e.key === 'Enter') { e.preventDefault(); doAdd(); }
+                });
+            }
+        })();
+        </script>
 
         <?php elseif ( $tab === 'asset_fields' ) : ?>
         <section class="cmms-section">
@@ -6036,6 +13409,8 @@ body {
 
         <?php elseif ( $tab === 'notify' ) : $this->view_settings_notify( $u ); endif; ?>
         <?php if ( $tab === 'billing' && $is_owner ) : $this->view_settings_billing( $u ); endif; ?>
+        <?php // 1.14.84: Telegram tab — per-user linking to bot. ?>
+        <?php if ( $tab === 'telegram' && CMMS_Telegram::is_enabled() ) : $this->view_settings_telegram( $u ); endif; ?>
         <?php
     }
 
@@ -6045,6 +13420,122 @@ body {
      * Owner-only. Shows the current plan, billing cycle, next charge
      * date, and (most importantly) a "Cancel subscription" button that
      * cancels the recurring charge at iCredit and marks the account
+    /**
+     * 1.14.84: Telegram linking tab. Each user can link/unlink their
+     * own Telegram account here. The token is per-user, single-use,
+     * and expires in 30 minutes. After clicking "Connect Telegram",
+     * the user opens the deep-link in Telegram, the bot fires /start
+     * <token>, and the binding completes.
+     */
+    private function view_settings_telegram( $u ) {
+        // Handle disconnect action
+        if ( ! empty( $_POST['cmms_telegram_unlink'] ) ) {
+            check_admin_referer( 'cmms_telegram_unlink', 'cmms_telegram_unlink_nonce' );
+            CMMS_Telegram::unlink( (int) $u->id );
+            // Re-fetch to show updated state
+            wp_safe_redirect( $this->url( array( 'view' => 'settings', 'tab' => 'telegram', 'unlinked' => 1 ) ) );
+            exit;
+        }
+
+        $link        = CMMS_Telegram::get_link( (int) $u->id );
+        $is_linked   = ( $link && ! empty( $link->telegram_user_id ) );
+        $bot_username= CMMS_Telegram::bot_username();
+        $unlinked    = ! empty( $_GET['unlinked'] );
+        ?>
+        <section class="cmms-section">
+            <div class="cmms-section-head">
+                <h3 class="cmms-section-title">
+                    📱 חיבור לטלגרם
+                </h3>
+            </div>
+            <div class="cmms-section-body">
+
+                <?php if ( $unlinked ) : ?>
+                    <div class="cmms-alert cmms-alert-success" style="margin-bottom:14px;">
+                        ✅ החיבור לטלגרם בוטל בהצלחה
+                    </div>
+                <?php endif; ?>
+
+                <p class="cmms-muted" style="margin:0 0 18px;">
+                    קבל התראות על משימות חדשות ועדכן סטטוסים ישירות מטלגרם.
+                    הבוט שולח לך הודעה כשמשימה מוקצית אליך, ומאפשר לך לסמן
+                    סטטוסים, לצרף תמונות ולכתוב הערות.
+                </p>
+
+                <?php if ( $is_linked ) : ?>
+                    <div style="background:#f0fdf4;border:1px solid #86efac;padding:14px 18px;border-radius:10px;margin-bottom:14px;">
+                        <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+                            <span style="font-size:18px;">✅</span>
+                            <strong style="color:#166534;font-size:14px;">החשבון מחובר לטלגרם</strong>
+                        </div>
+                        <?php if ( $link->telegram_first_name || $link->telegram_username ) : ?>
+                            <div style="font-size:13px;color:#15803d;padding-inline-start:28px;">
+                                <?php
+                                $name_parts = array();
+                                if ( $link->telegram_first_name ) $name_parts[] = $link->telegram_first_name;
+                                if ( $link->telegram_username )   $name_parts[] = '@' . $link->telegram_username;
+                                echo esc_html( implode( ' · ', $name_parts ) );
+                                ?>
+                            </div>
+                        <?php endif; ?>
+                        <?php if ( $link->connected_at ) : ?>
+                            <div style="font-size:11px;color:#16a34a;padding-inline-start:28px;margin-top:4px;">
+                                מחובר מאז: <?php echo esc_html( mysql2date( 'd/m/Y H:i', $link->connected_at ) ); ?>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+
+                    <form method="post" style="margin:0;">
+                        <?php wp_nonce_field( 'cmms_telegram_unlink', 'cmms_telegram_unlink_nonce' ); ?>
+                        <input type="hidden" name="cmms_telegram_unlink" value="1">
+                        <button type="submit" class="cmms-btn cmms-btn-secondary"
+                                onclick="return confirm('לבטל את החיבור לטלגרם? תפסיק לקבל הודעות מהבוט.');">
+                            🔌 נתק את הטלגרם
+                        </button>
+                    </form>
+
+                <?php else :
+                    // Not linked — generate a fresh token and show the deep-link.
+                    $token = CMMS_Telegram::generate_link_token( (int) $u->id );
+                    $deep_link = $token ? CMMS_Telegram::build_link_url( $token ) : '';
+                    ?>
+                    <?php if ( ! $bot_username || ! $deep_link ) : ?>
+                        <div class="cmms-alert cmms-alert-warning">
+                            ⚠️ הבוט לא מוגדר במלואו. פנה למנהל המערכת.
+                        </div>
+                    <?php else : ?>
+                        <div style="background:#eff6ff;border:1px solid #bfdbfe;padding:16px 18px;border-radius:10px;">
+                            <div style="font-weight:600;color:#1e40af;margin-bottom:10px;">
+                                כדי להתחבר:
+                            </div>
+                            <ol style="margin:0 0 14px;padding-inline-start:20px;color:#1e3a8a;font-size:13.5px;line-height:1.8;">
+                                <li>לחץ על הכפתור הכחול למטה</li>
+                                <li>טלגרם ייפתח עם הבוט שלנו</li>
+                                <li>לחץ "START" או שלח /start</li>
+                                <li>תקבל הודעת אישור והחשבון יחובר</li>
+                            </ol>
+                            <a href="<?php echo esc_url( $deep_link ); ?>"
+                               target="_blank"
+                               class="cmms-btn cmms-btn-primary"
+                               style="background:#229ED9;border-color:#229ED9;">
+                                📱 פתח את הבוט בטלגרם
+                            </a>
+                            <div style="font-size:11px;color:#3b82f6;margin-top:10px;">
+                                הקישור תקף ל-30 דקות.
+                                אם פג תוקף — רענן את הדף.
+                            </div>
+                        </div>
+                    <?php endif; ?>
+                <?php endif; ?>
+            </div>
+        </section>
+        <?php
+    }
+
+    /**
+     * 1.14.56: Billing & Subscription settings tab.
+     * Allows users with manage permission (owner) to view their plan,
+     * change seat count, and cancel — flipping subscription_status
      * as canceled_pending.
      *
      * Compliance note: under Israel's Consumer Protection Law (Tikun
@@ -6055,9 +13546,7 @@ body {
     private function view_settings_billing( $u ) {
         global $wpdb;
         $accounts_t = CMMS_DB::table( 'accounts' );
-        $subs_t     = CMMS_DB::table( 'subscriptions' );
-
-        $account = $wpdb->get_row( $wpdb->prepare(
+        $subs_t     = CMMS_DB::table( 'subscriptions' );        $account = $wpdb->get_row( $wpdb->prepare(
             "SELECT * FROM $accounts_t WHERE id = %d",
             (int) $u->account_id
         ), ARRAY_A );
